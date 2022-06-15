@@ -35,6 +35,7 @@ class DTensorType(Enum):
     REPLICATED = auto()
     SHARDED = auto()
     PARTIAL = auto()
+    ONDEMAND = auto()
 
 
 # A tag attached to local parameter to indicating how users plan to convert it
@@ -46,21 +47,38 @@ class DTensorTag:
     pg: ProcessGroup = None
 
 
+def _tag_module(module: nn.Module, tag: DTensorTag):
+    for p in module.parameters():
+        if not hasattr(p, "_dtags"):
+            p._dtags = []
+
+        p._dtags.append(tag)
+
+
 # A thin layer implementation of DDP, that only add tags to model parameters.
 class DDP(nn.Module):
     """
     Tag each param as replicated
     """
-    def __init__(self, module, pg=None):
+    def __init__(self, module: nn.Module, pg: ProcessGroup=None):
         super().__init__()
         self.module = module
 
-        for p in module.parameters():
-            if not hasattr(p, "_dtags"):
-                p._dtags = []
+        _tag_module(module, DTensorTag(dttype=DTensorType.REPLICATED, pg=pg))
 
-            p._dtags.append(DTensorTag(dttype=DTensorType.REPLICATED, pg=pg))
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
 
+
+class FSDP(nn.Module):
+    """
+    Tag each param as ondemand
+    """
+    def __init__(self, module: nn.Module, pg: ProcessGroup=None):
+        super().__init__()
+        self.module = module
+
+        _tag_module(module, DTensorTag(dttype=DTensorType.ONDEMAND, pg=pg))
 
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
@@ -136,6 +154,7 @@ class Engine:
         # to access original param, instead of us keeping the following maps.
         self.primal_to_param = {}
         self.grad_to_primal = {}
+        self.param_views = {}
 
         self.compiled_m = None
 
@@ -146,6 +165,39 @@ class Engine:
         # HACK: AOTAutograd cannot trace the train_step yet, so compile the
         # module for now.
         self.compiled_m(x).sum().backward()
+
+    def handle_ondemand_fwd(self, gm: fx.GraphModule, primal: fx.Node):
+        primal_views = set([primal])
+        first_node = None
+        last_node = None
+        # HACK: assume gm.graph.nodes iterate through topological order.
+        for node in gm.graph.nodes:
+            if all([
+                node.op == "call_function" and
+                node.target == "aten.t" and
+                len(node.args) == 1 and
+                node.args[0] in primal_views
+            ]):
+                primal_views.add(node)
+
+            # find the first and the last usage
+            if primal in node.args and first_node is None:
+                # the first usage must be on the primal not its views
+                first_node = node
+
+            if any([view in node.args for view in primal_views]):
+                # the last usage can be on any views, we need to keep the param
+                # alive up to this point
+                last_node = node
+
+            # insert allgather before first usage
+
+            # insert reshard after last usage
+
+
+
+    def handle_ondemand_bwd(self, gm: fx.GraphModule):
+        pass
 
     def compile_fwd(self, gm: fx.GraphModule, inps):
         # HACK: use pytree order of params to map to primals, and save the info
@@ -161,11 +213,18 @@ class Engine:
         for node in gm.graph.nodes:
             if node.op == "placeholder" and node.target.startswith("primal"):
                 p = to_param(self.module, node.name)
-                if p is not None:
+                if p is not None and hasattr(p, "_dtags"):
                     assert node.target not in self.primal_to_param, (
                         f"inserting {node.target} twice"
                     )
                     self.primal_to_param[node.target] = p
+
+                    for tag in p._dtags:
+                        if tag.dttype == DTensorType.ONDEMAND:
+                            # insert FSDP logic to allgather and discard params
+                            # 1. find 1st usage and last usage of a primal
+                            # 2. insert
+
 
         logging.info(
             "\nFinished compiling forward, identified following Distributed Tensors\n" +
