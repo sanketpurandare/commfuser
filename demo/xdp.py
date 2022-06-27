@@ -8,18 +8,21 @@ import torch.fx as fx
 import torch.multiprocessing as mp
 import torch.utils._pytree as pytree
 
-
 from dataclasses import dataclass
 from enum import Enum, auto
-from functools import partial
+from functools import partial, reduce
 from typing import (
     Any,
     Callable,
     Optional,
 )
+
 import logging
+import math
 import os
 
+# HACK:
+engine = None
 
 
 class MyModel(nn.Module):
@@ -120,6 +123,38 @@ def fused_allreduce(tensors, pg):
         offset += numel
 
 
+def ondemand_allgather(param, pg):
+    # HACK
+    global engine
+
+    print(f"==== before calling on-demand allgather {param.data.shape}, {param._local_shard.shape}")
+    #param = engine.get_param(primal)
+    local_shard = param._local_shard
+    orig_size = param._orig_size
+    with torch.no_grad():
+        world_size = dist.get_world_size(group=pg)
+        buffer = torch.empty([world_size] + list(local_shard.shape))
+        tensors = [buffer[i] for i in range(world_size)]
+        dist.all_gather(tensors, local_shard, group=pg)
+        size = list(orig_size)
+        numel = reduce(lambda x, y: x * y, size, 1)
+        param.data = buffer[:numel].view(size)
+
+    print(f"==== after calling on-demand allgather {param.data.shape}")
+    return param
+
+def ondemand_discard(param, _):
+    # HACK
+    global engine
+
+    print(f"==== before calling on-demand discard {param.data.shape}")
+    #param = engine.get_param(primal)
+    with torch.no_grad():
+        param.data = param._local_shard
+
+    print(f"==== after calling on-demand discard {param.data.shape}")
+
+
 class Engine:
     r"""
     Compile the provided ``train_step`` function. Then, based on the tags on
@@ -158,48 +193,83 @@ class Engine:
 
         self.compiled_m = None
 
+        for p in self.module.parameters():
+            if hasattr(p, "_dtags"):
+                for tag in p._dtags:
+                    if tag.dttype == DTensorType.ONDEMAND:
+                        self._shard_param_storage(p, tag.pg)
+                        break
+
     def run(self, x: torch.Tensor):
         if self.compiled_m is None:
-            self.compiled_m = aot_module(self.module, self.compile_fwd, self.compile_bwd)
+            self.compiled_m = aot_module(self.module, self._compile_fwd, self._compile_bwd)
+
 
         # HACK: AOTAutograd cannot trace the train_step yet, so compile the
         # module for now.
-        self.compiled_m(x).sum().backward()
+        # self.compiled_m(x).sum().backward()
+        self.compiled_m(x).sum()
 
-    def handle_ondemand_fwd(self, gm: fx.GraphModule, primal: fx.Node):
+    def get_param(self, primal):
+        return self.primal_to_param[primal.target]
+
+    def _shard_param_storage(self, param, pg):
+        with torch.no_grad():
+            world_size = dist.get_world_size(group=pg)
+            rank = dist.get_rank(group=pg)
+
+            padded_size = int(math.ceil(param.numel() / world_size))
+            buffer = torch.empty(padded_size)
+            offset = rank * padded_size
+            to = min(offset + padded_size, param.numel())
+            buffer[:(to - offset)] = param.view(-1)[offset : to]
+            param._local_shard = buffer
+            param._orig_size = param.size()
+            #param.data = buffer
+
+    def _handle_ondemand_fwd(self, gm: fx.GraphModule, primal: fx.Node, pg: ProcessGroup):
         primal_views = set([primal])
-        first_node = None
-        last_node = None
+        first_usage = None
+        last_usage = None
         # HACK: assume gm.graph.nodes iterate through topological order.
         for node in gm.graph.nodes:
             if all([
                 node.op == "call_function" and
-                node.target == "aten.t" and
+                str(node.target) == "aten.t" and
                 len(node.args) == 1 and
                 node.args[0] in primal_views
             ]):
                 primal_views.add(node)
 
             # find the first and the last usage
-            if primal in node.args and first_node is None:
+            if primal in node.args and first_usage is None:
                 # the first usage must be on the primal not its views
-                first_node = node
+                first_usage = node
 
             if any([view in node.args for view in primal_views]):
                 # the last usage can be on any views, we need to keep the param
                 # alive up to this point
-                last_node = node
+                last_usage = node
 
-            # insert allgather before first usage
+        # insert allgather before first usage
+        with gm.graph.inserting_before(first_usage):
+            # HACK: call_function target cannot be member methods?
+            new_node = gm.graph.call_function(
+                ondemand_allgather,
+                args=(primal, pg)
+            )
+            first_usage.replace_input_with(primal, new_node)
 
-            # insert reshard after last usage
+        # insert reshard after last usage
+        with gm.graph.inserting_after(last_usage):
+            gm.graph.call_function(
+                ondemand_discard,
+                args=(primal, last_usage))
 
-
-
-    def handle_ondemand_bwd(self, gm: fx.GraphModule):
+    def _handle_ondemand_bwd(self, gm: fx.GraphModule):
         pass
 
-    def compile_fwd(self, gm: fx.GraphModule, inps):
+    def _compile_fwd(self, gm: fx.GraphModule, inps):
         # HACK: use pytree order of params to map to primals, and save the info
         # for compile_bwd.
         def to_param(model: nn.Module, primal_name: str) -> torch.nn.Parameter:
@@ -221,21 +291,37 @@ class Engine:
 
                     for tag in p._dtags:
                         if tag.dttype == DTensorType.ONDEMAND:
-                            # insert FSDP logic to allgather and discard params
-                            # 1. find 1st usage and last usage of a primal
-                            # 2. insert
-
+                            self._handle_ondemand_fwd(gm, node, tag.pg)
 
         logging.info(
             "\nFinished compiling forward, identified following Distributed Tensors\n" +
             "\n".join([f"{pl} : {pm._dtags}" for pl, pm in self.primal_to_param.items()])
         )
+
+        gm.graph.lint()
+        gm.recompile()
+        logging.info("Modified forward")
+        gm.graph.print_tabular()
+        logging.info("===Done printing forward")
         return gm
 
-    def compile_bwd(self, gm: fx.GraphModule, inps):
+    def _compile_bwd(self, gm: fx.GraphModule, inps):
         logging.info("Compiling backward")
         logging.info("Original backward graph")
         gm.graph.print_tabular()
+
+
+        # HACK
+        for node in gm.graph.nodes:
+            first_node = node
+            break
+        with gm.graph.inserting_before(first_node):
+            for primal in self.primal_to_param:
+                gm.graph.call_function(
+                    ondemand_allgather,
+                    args=(primal, None)
+                )
+
         # insert individual allreduce
         pgs = {}
         for node in gm.graph.nodes:
@@ -307,14 +393,16 @@ def train_step(model: nn.Module, x: torch.Tensor):
 
 
 def run_worker(rank, world_size):
+    global engine
     logging.getLogger().setLevel(logging.DEBUG if rank == 0 else logging.CRITICAL)
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
-    n_features = 10000
+    n_features = 20
     # create local model on CPU
     model = MyModel(n_features, 2)
     # tag all parameters as replicated tensor
-    model = DDP(model)
+    # model = DDP(model)
+    model = FSDP(model)
     # we should be able to support the following as well
     # DDP(FSDP(model, pg=intra_node), pg=inter_node)
 
@@ -326,6 +414,8 @@ def run_worker(rank, world_size):
         x = torch.randn(2, n_features)
         # run the compiled train_step
         engine.run(x)
+        for p in model.parameters():
+            print(f" after iteration {p.shape}")
 
     # Discussion:
     # Explicitly passing train_step to Engine rather than using the following API
@@ -336,10 +426,14 @@ def run_worker(rank, world_size):
 
 
 if __name__=="__main__":
+
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29500"
+    """
     world_size = 1
     mp.spawn(run_worker,
         args=(world_size,),
         nprocs=world_size,
         join=True)
+    """
+    run_worker(0, 1)
