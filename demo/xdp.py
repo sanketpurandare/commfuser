@@ -14,7 +14,9 @@ from functools import partial, reduce
 from typing import (
     Any,
     Callable,
+    Dict,
     Optional,
+    Set,
 )
 
 import logging
@@ -31,7 +33,10 @@ class MyModel(nn.Module):
         self.seq = nn.Sequential(*[nn.Linear(n_features, n_features) for _ in range(n_layers)])
 
     def forward(self, x):
-        return self.seq(x)
+        print("=== before fwd")
+        out = self.seq(x)
+        print("=== after fwd")
+        return out
 
 # Type of the distributed tensor
 class DTensorType(Enum):
@@ -151,6 +156,7 @@ def ondemand_discard(param, _):
     #param = engine.get_param(primal)
     with torch.no_grad():
         param.data = param._local_shard
+        #pass
 
     print(f"==== after calling on-demand discard {param.data.shape}")
 
@@ -187,11 +193,16 @@ class Engine:
         self.n_grads = sum([p.requires_grad for p in module.parameters()])
         # HACK: ideally, it will be better if fx/AOTAutograd can provide a way
         # to access original param, instead of us keeping the following maps.
+        self.view_to_parent = {}
+        self.view_name_to_primal = {}
         self.primal_to_param = {}
         self.grad_to_primal = {}
         self.param_views = {}
+        self.pytree_params = [p for _, p in list(pytree.tree_flatten(module.named_parameters())[0][0])]
+        self.pytree_params.reverse()
 
         self.compiled_m = None
+        self.fwd_gm = None
 
         for p in self.module.parameters():
             if hasattr(p, "_dtags"):
@@ -205,10 +216,22 @@ class Engine:
             self.compiled_m = aot_module(self.module, self._compile_fwd, self._compile_bwd)
 
 
-        # HACK: AOTAutograd cannot trace the train_step yet, so compile the
-        # module for now.
-        # self.compiled_m(x).sum().backward()
-        self.compiled_m(x).sum()
+        if self.fwd_gm is None:
+            # HACK: AOTAutograd cannot trace the train_step yet, so compile the
+            # module for now.
+            # self.compiled_m(x).sum().backward()
+            self.compiled_m(x).sum()
+        else:
+            # HACK: need to disable guards
+            print("----calling fwd_gm")
+            self.fwd_gm.graph.print_tabular()
+            outs = self.fwd_gm(*self.pytree_params, x)
+            out, activations = outs[0], outs[1:]
+            out_grad = torch.ones_like(out)
+            # needs to change backward input as after compilation, it takes original
+            # param instead of its views
+            #self.bwd_gm(*activations, out_grad)
+            #print(f"forward outout is {outs}")
 
     def get_param(self, primal):
         return self.primal_to_param[primal.target]
@@ -227,47 +250,94 @@ class Engine:
             param._orig_size = param.size()
             #param.data = buffer
 
-    def _handle_ondemand_fwd(self, gm: fx.GraphModule, primal: fx.Node, pg: ProcessGroup):
-        primal_views = set([primal])
-        first_usage = None
-        last_usage = None
-        # HACK: assume gm.graph.nodes iterate through topological order.
+    def _find_primal_views(self, gm: fx.GraphModule, primal: fx.Node):
+        view_to_parent = {primal: primal}
         for node in gm.graph.nodes:
             if all([
                 node.op == "call_function" and
                 str(node.target) == "aten.t" and
                 len(node.args) == 1 and
-                node.args[0] in primal_views
+                node.args[0] in view_to_parent
             ]):
-                primal_views.add(node)
+                view_to_parent[node] = node.args[0]
 
-            # find the first and the last usage
-            if primal in node.args and first_usage is None:
-                # the first usage must be on the primal not its views
-                first_usage = node
+        return view_to_parent
 
-            if any([view in node.args for view in primal_views]):
-                # the last usage can be on any views, we need to keep the param
-                # alive up to this point
-                last_usage = node
+    def _find_param_usages(self, gm: fx.GraphModule, views: Set[fx.Node]):
+        usages = []
+        for node in gm.graph.nodes:
+            for view in views:
+                if view in node.args:
+                    usages.append(node)
+
+        return usages
+
+    def _recover_param_primals(self, gm: fx.GraphModule):
+
+        view_name_to_node = {v.name: v for v, p in self.view_to_parent.items()}
+        for node in gm.graph.nodes:
+            if node.op == "placeholder" and node.name in view_name_to_node:
+                view_node = view_name_to_node[node.name]
+                node_to_insert = []
+                while view_node != self.view_to_parent[view_node]:
+                    node_to_insert.append(view_node)
+                    view_node = self.view_to_parent[view_node]
+
+                node_to_insert.append(view_node)
+                node_to_insert.reverse()
+                print("++++ inserting ", node_to_insert)
+                new_nodes = {}
+
+                def arg_transform(arg):
+                    if arg.name in new_nodes:
+                        return new_nodes[arg.name]
+                    else:
+                        raise RuntimeError(f"Unrecognized arg {arg}")
+
+                with gm.graph.inserting_before(node):
+                    for to_insert in node_to_insert:
+                        for arg in to_insert.args:
+                            new_node = gm.graph.node_copy(arg, arg_transform=arg_transform)
+                            new_nodes[arg.name] = new_node
+                        new_node = gm.graph.node_copy(to_insert, arg_transform=arg_transform)
+                        new_nodes[to_insert.name] = new_node
+
+                node.replace_all_uses_with(new_node)
+                gm.graph.erase_node(node)
+
+        gm.graph.print_tabular()
+        gm.graph.lint()
+        #gm.recompile()
+
+    def _handle_ondemand_fwd(self, gm: fx.GraphModule, primal: fx.Node, pg: ProcessGroup):
+        views = self._find_primal_views(gm, primal)
+        self.view_to_parent.update(views)
+        usages = self._find_param_usages(gm, set(views.keys()))
 
         # insert allgather before first usage
-        with gm.graph.inserting_before(first_usage):
+        with gm.graph.inserting_before(usages[0]):
             # HACK: call_function target cannot be member methods?
             new_node = gm.graph.call_function(
                 ondemand_allgather,
                 args=(primal, pg)
             )
-            first_usage.replace_input_with(primal, new_node)
+            usages[0].replace_input_with(primal, new_node)
 
         # insert reshard after last usage
-        with gm.graph.inserting_after(last_usage):
+        with gm.graph.inserting_after(usages[-1]):
             gm.graph.call_function(
                 ondemand_discard,
-                args=(primal, last_usage))
+                args=(primal, usages[-1]))
 
-    def _handle_ondemand_bwd(self, gm: fx.GraphModule):
-        pass
+    def _handle_ondemand_bwd(self, gm: fx.GraphModule, primal: fx.Node):
+        param_primal = self.view_name_to_primal[node.name]
+        param = self.primal_to_param[param_primal]
+        with gm.graph.inserting_before(primal):
+            param_node = gm.graph.placeholder(param_primal.name, default_value=param)
+        usages = self._find_param_usages(gm, self._find_primal_views(gm, primal))
+
+        with gm.graph.inserting_before(usage[0]):
+            new_node
 
     def _compile_fwd(self, gm: fx.GraphModule, inps):
         # HACK: use pytree order of params to map to primals, and save the info
@@ -302,7 +372,7 @@ class Engine:
         gm.recompile()
         logging.info("Modified forward")
         gm.graph.print_tabular()
-        logging.info("===Done printing forward")
+        self.fwd_gm = gm
         return gm
 
     def _compile_bwd(self, gm: fx.GraphModule, inps):
@@ -310,17 +380,21 @@ class Engine:
         logging.info("Original backward graph")
         gm.graph.print_tabular()
 
-
-        # HACK
+        # insert individual allgather
+        self._recover_param_primals(gm)
+        logging.info("==== After recover param primals")
+        gm.graph.print_tabular()
+        """
+        self.view_name_to_primal = {v.name : p for v, p in self.view_to_primal}
+        primal_to_param = {}
         for node in gm.graph.nodes:
-            first_node = node
-            break
-        with gm.graph.inserting_before(first_node):
-            for primal in self.primal_to_param:
-                gm.graph.call_function(
-                    ondemand_allgather,
-                    args=(primal, None)
-                )
+            if node.op == "placeholder" and node.name in view_name_to_primal:
+                param_primal = self.view_name_to_primal[node.name]
+                param = self.primal_to_param[param_primal]
+                for tag in param._dtags:
+                    if tag.dttype == DTensorType.ONDEMAND:
+                        self._handle_ondemand_bwd(gm, node, tag.pg)
+        """
 
         # insert individual allreduce
         pgs = {}
@@ -375,6 +449,7 @@ class Engine:
         gm.graph.print_tabular()
 
         logging.info("finished compiling backward")
+        self.bwd_gm = gm
         return gm
 
 
@@ -414,8 +489,6 @@ def run_worker(rank, world_size):
         x = torch.randn(2, n_features)
         # run the compiled train_step
         engine.run(x)
-        for p in model.parameters():
-            print(f" after iteration {p.shape}")
 
     # Discussion:
     # Explicitly passing train_step to Engine rather than using the following API
