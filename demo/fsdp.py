@@ -24,9 +24,6 @@ import logging
 import math
 import os
 
-# HACK:
-engine = None
-
 
 class MyModel(nn.Module):
     def __init__(self, n_features, n_layers):
@@ -75,66 +72,47 @@ class FSDP(nn.Module):
         return self.module(*args, **kwargs)
 
 
-# HACK: dist.allreduce is not compatible with fx/AOTAutograd yet. It will be
-# better if we convert comm ops into ATen operators. That will help address two
-# problems:
-# 1. We can get rid of this function, and directly do graph.call_function(dist.all_reduce, ...)
-# 2. It will also be prettier and more readable with ATen comm ops in fx graph;
-#    Currently it shows as "call_function  all_reduce_5  <function all_reduce at 0x7ff2524e7b80>  (t_11, None)".
-def allreduce(tensor, pg):
-    logging.info(f"AllReduce Tensor of shape {tensor.shape}")
-    dist.all_reduce(tensor, group=pg)
-
-
-# HACK:
-# 1. ditto
-# 2. The current version is a synchronized call. We need to make it asynchronized,
-#    queue the copy-back bottom-half as callbacks on the returned future, and then
-#    insert a wait() fx node at the end of backward.
-def fused_allreduce(tensors, pg):
-    logging.info(f"Fused AllReduce Tensors of shape {[t.shape for t in tensors]}")
-    # TODO: we are creating a new buffer on every fused allreduce, which is slow.
-    # We should instead creating the buffers upfront and just doing copy here.
-    buffer = torch.empty(sum([t.numel() for t in tensors]))
-    offset = 0
-    for t in tensors:
-        numel = t.numel()
-        buffer[offset:offset + numel] = t.view(-1)
-        offset += numel
-
-    dist.all_reduce(buffer, group=pg)
-
-    offset = 0
-    for t in tensors:
-        numel = t.numel()
-        t = buffer[offset:offset + numel].view(t.shape)
-        offset += numel
-
-
 def ondemand_allgather(param, pg):
-    # HACK
-    global engine
-
-    print(f"==== before calling on-demand allgather {param.data.shape}, {param._local_shard.shape}")
-    #param = engine.get_param(primal)
+    logging.info(f"AllGather param {param.shape}")
+    # HACK: using attributes on the parameter to keep track of local shard and
+    # original size. These should all be handled by DistributedTensor when ready.
     local_shard = param._local_shard
     orig_size = param._orig_size
     with torch.no_grad():
         world_size = dist.get_world_size(group=pg)
-        buffer = torch.empty([world_size] + list(local_shard.shape))
+        buffer = torch.empty([world_size] + list(local_shard.shape), device=param.device)
         tensors = [buffer[i] for i in range(world_size)]
+        # HACK: using synchronous allgather to demonstrate feasibility. This
+        # should be asynchronous in the final stack.
         dist.all_gather(tensors, local_shard, group=pg)
         size = list(orig_size)
         numel = reduce(lambda x, y: x * y, size, 1)
         param.data = buffer[:numel].view(size)
 
-    print(f"==== after calling on-demand allgather {param.data.shape}")
     return param
 
 
+# HACK: the second argument to this function is the output from the last usage
+# of the parameter. Passing that in and ignore it to make sure parameter is not
+# discarded before usage.
 def ondemand_discard(param, _):
+    logging.info(f"Discard param {param.shape}")
     with torch.no_grad():
         param.data = param._local_shard
+
+
+def ondemand_reducescatter(grad, pg):
+    with torch.no_grad():
+        world_size = dist.get_world_size(group=pg)
+        rank = dist.get_rank(group=pg)
+
+        padded_size = int(math.ceil(grad.numel() / world_size))
+        output = torch.empty([padded_size], device=grad.device)
+        inputs_tensor = torch.empty([padded_size * world_size], device=grad.device)
+        inputs_tensor[:grad.numel()].copy_(grad.view(-1))
+        inputs = list(inputs_tensor.chunk(world_size))
+        dist.reduce_scatter(output, inputs, group=pg)
+        return output
 
 
 class Engine:
@@ -151,7 +129,7 @@ class Engine:
                                ``Engine`` will joinly optimize the entire
                                ``train_step``.
     """
-    def __init__(self, module: nn.Module, train_step: Callable, bucket_mb: int=25):
+    def __init__(self, module: nn.Module, train_step: Callable):
         # HACK: Meta device tracing is not ready. Have to create the module on
         # CPU for now.
         self.module = module
@@ -159,7 +137,6 @@ class Engine:
         # through the full fwd + bwd + opt.step yet. Based on the discussion with
         # compiler this, this is addressable.
         self.train_step = train_step
-        self.bucket_mb = bucket_mb
         # HACK: today, there is no good way to map AOTAutograd primals back to
         # parameters in the original model. The current implementation relies on
         # the implicit AOTAutograd behavior that primals match the order of
@@ -170,62 +147,63 @@ class Engine:
         # HACK: ideally, it will be better if fx/AOTAutograd can provide a way
         # to access original param, instead of us keeping the following maps.
         self.view_to_parent = {}
-        self.view_name_to_primal = {}
         self.primal_to_param = {}
         self.grad_to_primal = {}
-        self.param_views = {}
         self.pytree_params = [p for _, p in list(pytree.tree_flatten(module.named_parameters())[0][0])]
         self.pytree_params.reverse()
 
         self.compiled_m = None
+        # HACK: FSDP triggers recompilation after sharding param storage. To
+        # avoid that recompilation, explicitly calling on fwd and bwd
+        # GraphModules.
         self.fwd_gm = None
+        self.bwd_gm = None
 
         for p in self.module.parameters():
             if hasattr(p, "_dtags"):
                 for tag in p._dtags:
                     if tag.dttype == DTensorType.ONDEMAND:
-                        self._shard_param_storage(p, tag.pg)
-                        break
+                        self._prepare_param_shard(p, tag.pg)
 
     def run(self, x: torch.Tensor):
         if self.compiled_m is None:
             self.compiled_m = aot_module(self.module, self._compile_fwd, self._compile_bwd)
 
-
-        if self.fwd_gm is None:
+        if self.fwd_gm is None or self.bwd_gm is None:
             # HACK: AOTAutograd cannot trace the train_step yet, so compile the
             # module for now.
-            # self.compiled_m(x).sum().backward()
-            self.compiled_m(x).sum()
-        else:
-            # HACK: need to disable guards
-            print("----calling fwd_gm")
-            self.fwd_gm.graph.print_tabular()
-            outs = self.fwd_gm(*self.pytree_params, x)
-            out, activations = outs[0], outs[1:]
-            out_grad = torch.ones_like(out)
-            # FIXME: needs to change backward input as after compilation, it takes original
-            # param instead of its views
-            self.bwd_gm(*activations, out_grad)
-            #print(f"forward outout is {outs}")
+            self.compiled_m(x)
+            assert self.fwd_gm is not None and self.bwd_gm is not None, (
+                "Forward and backward GraphModules are not generated."
+            )
 
-    def get_param(self, primal):
-        return self.primal_to_param[primal.target]
+        # HACK: Have to directly call fwd and bwd GraphModule to avoid
+        # recompilation. Ideally, it will be helpful to control which guards
+        # can be skipped.
+        outs = self.fwd_gm(*self.pytree_params, x)
+        out, activations = outs[0], outs[1:]
+        # HACK: using a fack grad for output to trigger backward
+        out_grad = torch.ones_like(out)
+        self.bwd_gm(*activations, out_grad)
 
-    def _shard_param_storage(self, param, pg):
+    def _prepare_param_shard(self, param: torch.nn.Parameter, pg: ProcessGroup):
         with torch.no_grad():
             world_size = dist.get_world_size(group=pg)
             rank = dist.get_rank(group=pg)
 
             padded_size = int(math.ceil(param.numel() / world_size))
-            buffer = torch.empty(padded_size)
+            buffer = torch.empty([padded_size], device=param.device)
             offset = rank * padded_size
             to = min(offset + padded_size, param.numel())
             buffer[:(to - offset)] = param.view(-1)[offset : to]
             param._local_shard = buffer
             param._orig_size = param.size()
-            #param.data = buffer
+            # HACK: cannot set param.data to the shard yet, because AOTAutograd
+            # requires to run the module once to get the graph. Eventually, we
+            # need to make compilers work with meta device.
 
+    # Find all views of a parameter, and return a dict that maps child view to
+    # parent view.
     def _find_primal_views(self, gm: fx.GraphModule, primal: fx.Node) -> Dict[fx.Node, fx.Node]:
         view_to_parent = {primal: primal}
         for node in gm.graph.nodes:
@@ -239,6 +217,8 @@ class Engine:
 
         return view_to_parent
 
+    # Find all usages on parameter and its views in the graph. This later helps
+    # to insert allgather before first usage and discard after the last usage
     def _find_param_usages(self, gm: fx.GraphModule, views: Set[fx.Node]) -> List[fx.Node]:
         usages = []
         for node in gm.graph.nodes:
@@ -248,64 +228,15 @@ class Engine:
 
         return usages
 
-    def _recover_param_primals(self, gm: fx.GraphModule):
-        view_name_to_node = {v.name: v for v, p in self.view_to_parent.items()}
-        for node in gm.graph.nodes:
-            if node.op == "placeholder" and node.name in view_name_to_node:
-                view_node = view_name_to_node[node.name]
-                node_to_insert = []
-                while view_node != self.view_to_parent[view_node]:
-                    node_to_insert.append(view_node)
-                    view_node = self.view_to_parent[view_node]
-
-                node_to_insert.append(view_node)
-                node_to_insert.reverse()
-                print("++++ inserting ", node_to_insert)
-                new_nodes = {}
-
-                def arg_transform(arg):
-                    if arg.name in new_nodes:
-                        return new_nodes[arg.name]
-                    else:
-                        raise RuntimeError(f"Unrecognized arg {arg}")
-
-                param_primal = None
-                with gm.graph.inserting_before(node):
-                    for to_insert in node_to_insert:
-                        for arg in to_insert.args:
-                            new_node = gm.graph.node_copy(arg, arg_transform=arg_transform)
-                            new_nodes[arg.name] = new_node
-                        new_node = gm.graph.node_copy(to_insert, arg_transform=arg_transform)
-                        new_nodes[to_insert.name] = new_node
-                        param_primal = new_node if new_node.op == "placeholder" else param_primal
-
-                #print("!!!!!!!!!!!!!! last node inserted ", new_node)
-
-                node.replace_all_uses_with(new_node)
-
-                views = set(self._find_primal_views(gm, new_node).keys())
-                usages = self._find_param_usages(gm, views)
-
-                # insert reshard after last usage
-                with gm.graph.inserting_after(usages[-1]):
-                    gm.graph.call_function(
-                        ondemand_discard,
-                        args=(param_primal, usages[-1]))
-
-                gm.graph.erase_node(node)
-
-        gm.graph.print_tabular()
-        gm.graph.lint()
-        #gm.recompile()
-
-    def _handle_ondemand_fwd(self, gm: fx.GraphModule, primal: fx.Node, pg: ProcessGroup):
+    # For one parameter primal, insert allgather before first usage, and discard
+    # after the last usage.
+    def _handle_one_param_primal(self, gm: fx.GraphModule, primal: fx.Node, pg: ProcessGroup):
         views = self._find_primal_views(gm, primal)
         self.view_to_parent.update(views)
         usages = self._find_param_usages(gm, set(views.keys()))
 
         # insert allgather before first usage
         with gm.graph.inserting_before(usages[0]):
-            # HACK: call_function target cannot be member methods?
             new_node = gm.graph.call_function(
                 ondemand_allgather,
                 args=(primal, pg)
@@ -317,16 +248,6 @@ class Engine:
             gm.graph.call_function(
                 ondemand_discard,
                 args=(primal, usages[-1]))
-
-    def _handle_ondemand_bwd(self, gm: fx.GraphModule, primal: fx.Node):
-        param_primal = self.view_name_to_primal[node.name]
-        param = self.primal_to_param[param_primal]
-        with gm.graph.inserting_before(primal):
-            param_node = gm.graph.placeholder(param_primal.name, default_value=param)
-        usages = self._find_param_usages(gm, set(self._find_primal_views(gm, primal).keys()))
-
-        with gm.graph.inserting_before(usage[0]):
-            new_node
 
     def _compile_fwd(self, gm: fx.GraphModule, inps):
         # HACK: use pytree order of params to map to primals, and save the info
@@ -350,9 +271,13 @@ class Engine:
 
                     for tag in p._dtags:
                         if tag.dttype == DTensorType.ONDEMAND:
-                            self._handle_ondemand_fwd(gm, node, tag.pg)
+                            self._handle_one_param_primal(gm, node, tag.pg)
 
-            # HACK: return parameter primals instead of its views
+            # HACK: AOTAutograd records parameter views instead of parameters
+            # and use them in the backward graph, which makes the FSDP fwd logic
+            # differ from backward. Change this behavior to use parameter primal
+            # as the fwd output to make allgather logic consistent in both
+            # graphs.
             if node.op == "output":
                 new_args = ([],)
                 for i, arg in enumerate(node.args[0]):
@@ -376,6 +301,7 @@ class Engine:
         gm.recompile()
         logging.info("Modified forward")
         gm.graph.print_tabular()
+        # HACK: record the graph and directly call it.
         self.fwd_gm = gm
         return gm
 
@@ -385,25 +311,62 @@ class Engine:
         gm.graph.print_tabular()
 
         # insert individual allgather
-        self._recover_param_primals(gm)
-        logging.info("==== After recover param primals")
-        gm.graph.print_tabular()
-        """
-        self.view_name_to_primal = {v.name : p for v, p in self.view_to_primal}
-        primal_to_param = {}
+        view_name_to_node = {v.name: v for v, p in self.view_to_parent.items()}
         for node in gm.graph.nodes:
-            if node.op == "placeholder" and node.name in view_name_to_primal:
-                param_primal = self.view_name_to_primal[node.name]
-                param = self.primal_to_param[param_primal]
-                for tag in param._dtags:
-                    if tag.dttype == DTensorType.ONDEMAND:
-                        self._handle_ondemand_bwd(gm, node, tag.pg)
-        """
+            if node.op == "placeholder" and node.name in view_name_to_node:
+                # Found a view of parameter primal, retrieve all precedding ops
+                # that generate this view
+                view_node = view_name_to_node[node.name]
+                node_to_insert = []
+                while view_node != self.view_to_parent[view_node]:
+                    node_to_insert.append(view_node)
+                    view_node = self.view_to_parent[view_node]
 
-        # insert individual allreduce
-        pgs = {}
+                node_to_insert.append(view_node)
+                node_to_insert.reverse()
+                new_nodes = {}
+
+                # bwd and fwd are different graphs, so bwd cannot directly
+                # access fwd node as argument. Apply transform.
+                def arg_transform(arg):
+                    if arg.name in new_nodes:
+                        return new_nodes[arg.name]
+                    else:
+                        raise RuntimeError(f"Unrecognized arg {arg}")
+
+                # inserting the ops that generated the view all the way up to
+                # the parameter primal placeholder
+                param_primal = None
+                with gm.graph.inserting_before(node):
+                    for to_insert in node_to_insert:
+                        for arg in to_insert.args:
+                            new_node = gm.graph.node_copy(arg, arg_transform=arg_transform)
+                            new_nodes[arg.name] = new_node
+                        new_node = gm.graph.node_copy(to_insert, arg_transform=arg_transform)
+                        new_nodes[to_insert.name] = new_node
+                        param_primal = new_node if new_node.op == "placeholder" else param_primal
+
+                node.replace_all_uses_with(new_node)
+
+                # After usages of the view and insert reshard after last usage
+                views = set(self._find_primal_views(gm, new_node).keys())
+                usages = self._find_param_usages(gm, views)
+
+                with gm.graph.inserting_after(usages[-1]):
+                    gm.graph.call_function(
+                        ondemand_discard,
+                        args=(param_primal, usages[-1]))
+
+                # erase original view node
+                gm.graph.erase_node(node)
+
+        logging.info("After recover param primals")
+        gm.graph.print_tabular()
+
+        logging.info("Insert Grad ReduceScatter")
         for node in gm.graph.nodes:
             if node.op == "output":
+                new_output_args = []
                 # HACK: again, relying on the implicit guarantee that primals
                 # and gradient outputs follow the same order.
                 i = 0
@@ -412,40 +375,18 @@ class Engine:
                     primal = f"primals_{i}"
                     self.grad_to_primal[grad_node.name] = primal
                     for dtag in self.primal_to_param[primal]._dtags:
-                        if dtag.dttype == DTensorType.REPLICATED:
+                        if dtag.dttype == DTensorType.ONDEMAND:
                             with gm.graph.inserting_after(grad_node):
-                                gm.graph.call_function(allreduce, args=(grad_node, dtag.pg))
-                                pgs[grad_node] = dtag.pg
+                                new_grad_node = gm.graph.call_function(
+                                    ondemand_reducescatter,
+                                    args=(grad_node, dtag.pg)
+                                )
+
+                                new_output_args.append(new_grad_node)
+
+                new_output_args.extend(node.args[0][self.n_grads:])
+                node.args = new_output_args
                 break
-
-        # fuse allreduce ops based on bucket_mb
-        comm_args, comm_nodes, comm_size, pg = [], [], 0, None
-        for node in gm.graph.nodes:
-            # HACK: allreduce is a custom Python function for now. It will be
-            # more readable if we convert it into an ATen operator
-            if node.name.startswith("allreduce"):
-                comm_args.append(node.args[0])
-                comm_size += self.primal_to_param[self.grad_to_primal[node.args[0].name]].numel()
-                comm_nodes.append(node)
-                assert pg is None or pg == pgs[node.args[0]], (
-                    "expecting the same ProcessGroup instance for now"
-                )
-                pg = pgs[node.args[0]]
-                last_node = node
-
-                if comm_size >= self.bucket_mb * 1e6:
-                    # accumulated comm size larger than the bucket size, fuse them.
-                    with gm.graph.inserting_after(last_node):
-                        gm.graph.call_function(fused_allreduce, args=(comm_args, pg))
-
-                    comm_args, comm_size = [], 0
-
-        if len(comm_args) > 0:
-            with gm.graph.inserting_after(last_node):
-                gm.graph.call_function(fused_allreduce, args=(comm_args, pg))
-
-        for node in comm_nodes:
-            gm.graph.erase_node(node)
 
         gm.graph.lint()
         gm.recompile()
@@ -453,6 +394,7 @@ class Engine:
         gm.graph.print_tabular()
 
         logging.info("finished compiling backward")
+        # HACK: record the graph and directly call it.
         self.bwd_gm = gm
         return gm
 
@@ -472,15 +414,15 @@ def train_step(model: nn.Module, x: torch.Tensor):
 
 
 def run_worker(rank, world_size):
-    global engine
     logging.getLogger().setLevel(logging.DEBUG if rank == 0 else logging.CRITICAL)
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
     n_features = 20
     # create local model on CPU
     model = MyModel(n_features, 2)
     # tag all parameters as replicated tensor
     # model = DDP(model)
+    model.to(rank)
     model = FSDP(model)
     # we should be able to support the following as well
     # DDP(FSDP(model, pg=intra_node), pg=inter_node)
@@ -490,7 +432,7 @@ def run_worker(rank, world_size):
     for i in range(3):
         logging.info(f"================== ITERATION {i} ====================")
         # dummy input
-        x = torch.randn(2, n_features)
+        x = torch.randn(2, n_features).to(rank)
         # run the compiled train_step
         engine.run(x)
 
