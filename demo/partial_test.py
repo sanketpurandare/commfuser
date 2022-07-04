@@ -88,8 +88,14 @@ def allreduce(tensor, pg):
     dist.all_reduce(tensor, group=pg)
 
 
-def test_buckets(grad, buckets):
-    print(buckets)
+def grad_as_bucket_view(states, grad, bucket_id, offset):
+    states.buckets[bucket_id][offset:(offset + grad.numel())] = grad.view(-1)
+    grad.data = states.buckets[bucket_id][offset:(offset + grad.numel())].view(grad.shape)
+
+
+def fused_allreduce(states, bucket_id, pg):
+    logging.info(f"Fused AllReduce bucket of shape {states.buckets[bucket_id].shape}")
+    dist.all_reduce(states.buckets[bucket_id], group=pg)
 
 
 class Engine:
@@ -130,16 +136,18 @@ class Engine:
         self.compiled_m = None
         self.optimize_ctx = None
 
+        # HACK:
         class StatesModule(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.buckets = [torch.zeros(2), torch.zeros(4)]
+                self.buckets = []
+                self.grads = []
 
         self.states = StatesModule()
 
     def run(self, x: torch.Tensor):
         if self.optimize_ctx is None:
-            self.optimize_ctx, structured_graphs = self._compile_and_extract_partial_graphs()
+            self.optimize_ctx = self._compile_and_extract_partial_graphs()
 
         print("==== running forward!")
         with self.optimize_ctx:
@@ -148,50 +156,99 @@ class Engine:
         out.sum().backward()
 
 
-    def _copy_to_bucket(self, grad: torch.Tensor, bucket_id: int):
-        pass
-
-    """
     def _fuse_allreduce(
         self,
         bucket_mb: int,
         structured_bwd_gms: List[Union[fx.GraphModule, Set[fx.GraphModule]]]
     ):
-        # Edits are inplace
-        # use the name "Phase" to distinguish with Pipeline "Stage"
+        print("111111111")
+        ordered_bwd_gms = [[x] if isinstance(x, fx.GraphModule) else list(x) for x in structured_bwd_gms]
 
-        grads, bucket_id, bucket_size, pg = [], 0, 0, None
-        for phase in structured_bwd_gms:
-            if isinstance(phase, fx.GraphModule):
-                gm, gid = phase, phase._gid
+        # normalized allreduce, similar to DDP
+        bucket_id, bucket_size, pg = 0, 0, None
+        for phase in ordered_bwd_gms:
+            print("22222222")
+            starting_bucket_id = bucket_id
+            for gm in phase:
                 # fuse allreduce ops based on bucket_mb
-                comm_args, comm_size, pg = [], 0, None
                 for node in gm.graph.nodes:
                     # HACK: allreduce is a custom Python function for now. It will be
                     # more readable if we convert it into an ATen operator
                     if node.name.startswith("allreduce"):
+                        # 1. build bucket
+                        primal = self.grad_to_primal[gm._id][node.args[0].name]
+                        offset = bucket_size
+                        bucket_size += self.primal_to_param[gm._id][primal].numel()
+
+                        # 2. insert copy_to_bucket node
+                        # NB: bucket is not ready, but we can insert node
                         with gm.graph.inserting_after(node):
-                            gm.graph.call_method()
+                            states_node = gm.graph.get_attr("states")
 
-                        grads.append(node.args[0])
-                        primal = self.grad_to_primal[gid][node.args[0].name]
-                        bucket_size += self.primal_to_param[gid][primal].numel()
-                        assert pg is None or pg == pgs[node.args[0]], (
-                            "expecting the same ProcessGroup instance for now"
-                        )
-                        pg = pgs[node.args[0]]
-                        last_node = node
+                        with gm.graph.inserting_after(states_node):
+                            gm.graph.call_function(
+                                grad_as_bucket_view,
+                                args=(states_node, node.args[0], bucket_id, offset)
+                            )
 
+
+
+                        # 3. remember the blocking allreduce for the bucket
                         if bucket_size >= self.bucket_mb * 1e6:
-                            # accumulated comm size larger than the bucket size, fuse them.
-                            with gm.graph.inserting_after(last_node):
-                                gm.graph.call_function(fused_allreduce, args=(grads, pg))
+                            self.states.buckets.append(torch.zeros(bucket_size))
+                            self.states.bucket_blocked_by.append((gm, node))
+                            bucket_size = 0
+                            bucket_id += 1
 
-                            comm_args, comm_size = [], 0
+            # 4. insert same sequence of buckets for all branches
+            for gm in phase:
+                last_node = next(iter(gm.graph.nodes))
+                for i, bucket in enumerate(self.states.buckets[starting_bucket_id:]):
+                    curr_bucket_id = starting_bucket_id + i
+                    blocked_by_gm, block_by_node = self.states.bucket_blocked_by[curr_bucket_id]
+                    if gm != blocked_by_gm:
+                        with gm.graph.inserting_after(last_node):
+                            states_node = gm.graph.get_attr("states")
 
-            else:
-                assert isinstance(phase, Set), f"Unexpected phase type {type(phase)}"
-    """
+                        with gm.graph.inserting_after(states_node):
+                            last_node = gm.graph.call_function(fused_allreduce, args=(states_node, curr_bucket_id, None))
+                    else:
+                        with gm.graph.inserting_after(blocked_by_node):
+                            states_node = gm.graph.get_attr("states")
+
+                        with gm.graph.inserting_after(states_node):
+                            last_node = gm.graph.call_function(fused_allreduce, args=(states_node, curr_bucket_id, None))
+
+        # 5. process remaining grads
+        if bucket_size > 0:
+            self.states.buckets.append(torch.zeros(bucket_size))
+            for gm in ordered_bwd_gms[-1]:
+                last_node = next(iter(reversed(gm.graph.nodes)))
+
+                with gm.graph.inserting_before(last_node):
+                    states_node = gm.graph.get_attr("states")
+
+                with gm.graph.inserting_after(states_node):
+                    gm.graph.call_function(fused_allreduce, args=(states_node, bucket_id, None))
+
+        # t. erase individual allreduce node
+        def erase_allreduce_node(gm):
+            nodes_to_erase = []
+            for node in gm.graph.nodes:
+                if node.name.startswith("allreduce"):
+                    nodes_to_erase.append(node)
+
+            for node in nodes_to_erase:
+                gm.graph.erase_node(node)
+
+        for phase in ordered_bwd_gms:
+            for gm in phase:
+                print("3333333")
+                erase_allreduce_node(gm)
+                gm.graph.lint()
+                gm.recompile()
+                gm.graph.print_tabular()
+
 
 
     def _aot_compile_fwd(self, gid: int, dynamo_fwd_gm: fx.GraphModule):
@@ -221,6 +278,8 @@ class Engine:
                 "\n".join([f"{pl} : {pm._dtags}" for pl, pm in self.primal_to_param[gid].items()])
             )
 
+            gm._id = gid
+            dynamo_fwd_gm._aot_fwd_graph = gm
             return gm
         return compile_fwd
 
@@ -244,16 +303,11 @@ class Engine:
                     for i, grad_node in enumerate(node.args[0][:n_grads]):
                         primal = f"primals_{i+1}"
                         self.grad_to_primal[gid][grad_node.name] = primal
-                        #print(f"++++ getting {gid}, {primal}")
                         for dtag in self.primal_to_param[gid][primal]._dtags:
                             if dtag.dttype == DTensorType.REPLICATED:
-                                with gm.graph.inserting_before(grad_node):
-                                    buckets = gm.graph.get_attr("states.buckets")
-
                                 with gm.graph.inserting_after(grad_node):
                                     gm.graph.call_function(allreduce, args=(grad_node, dtag.pg))
                                     pgs[grad_node] = dtag.pg
-                                    gm.graph.call_function(test_buckets, args=(grad_node, buckets,))
                     break
 
             gm.graph.lint()
@@ -262,6 +316,9 @@ class Engine:
             gm.graph.print_tabular()
 
             logging.info("finished compiling backward")
+
+            gm._id = gid
+            dynamo_fwd_gm._aot_bwd_graph = gm
             return gm
         return compile_bwd
 
@@ -331,14 +388,14 @@ class Engine:
         structured_graphs = []
         for gm in graphs:
             if len(gm._siblings) > 1:
-                structured_graphs.append(set(gm._siblings))
+                structured_graphs.append(set([g._aot_bwd_graph for g in gm._siblings]))
             else:
-                structured_graphs.append(gm)
+                structured_graphs.append(gm._aot_bwd_graph)
 
-        compiled_graphs = [None for _ in range(gid)]
+        self._fuse_allreduce(self.bucket_mb, structured_graphs)
 
         logging.info(f"Structured Sub-Graphs: {structured_graphs}")
-        return optimize_ctx, structured_graphs
+        return optimize_ctx
 
 
 # 1. how do we deal with local recompilation?
