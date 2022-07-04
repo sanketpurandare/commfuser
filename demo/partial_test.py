@@ -32,69 +32,6 @@ class MyModel(nn.Module):
         return [torch.ones(2, 10), -torch.ones(2, 10)]
 
 
-def same_activation(x, y):
-    if x.shape != y.shape or x.dtype != y.dtype or x.stride() != y.stride():
-        return False
-
-    if x.grad_fn is None and y.grad_fn is None:
-        return True
-
-    def same_autograd_graph(fn1, fn2):
-        if fn1 is None or fn2 is None:
-            return fn1 is None and fn2 is None
-
-        next_fns1, next_fns2 = fn1.next_functions, fn2.next_functions
-        if fn1.name() != fn2.name() or len(next_fns1) != len(next_fns2):
-            return False
-
-        for next_fn1, next_fn2 in zip(next_fns1, next_fns2):
-            if not same_autograd_graph(next_fn1[0], next_fn2[0]):
-                return False
-
-        return True
-
-    return same_autograd_graph(x.grad_fn, y.grad_fn)
-
-
-def get_partial_graphs(model):
-    # HACK: get these graphs from compiler
-    # HACK: this is not a generic solution to get structured graphs, for testing
-    # purpose only
-
-    graphs, graph_to_inputs, gid = [], {}, 0
-    def compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]):
-        nonlocal graphs, graph_to_inputs, gid
-
-        gm._siblings, gm._id, gm._inputs = [gm], gid, example_inputs
-        gid += 1
-        for prior_gm in graphs:
-            prior_inputs = graph_to_inputs[prior_gm]
-            if all([same_activation(x, y) for x, y in zip(example_inputs, prior_inputs)]):
-                prior_gm._siblings.append(gm)
-                gm._siblings = prior_gm._siblings
-                logging.info(f"Found siblings Sub-Graph-{gm._id} and Sub-Graph-{prior_gm._id}")
-
-        if len(gm._siblings) <= 1:
-            graphs.append(gm)
-            graph_to_inputs[gm] = example_inputs
-        return gm.forward
-
-    dummy_inputs = model.dummy_inputs()
-    with torchdynamo.optimize(compiler):
-        for x in dummy_inputs:
-            model(x)
-
-    structured_graphs = []
-    for gm in graphs:
-        if len(gm._siblings) > 1:
-            structured_graphs.append(set(gm._siblings))
-        else:
-            structured_graphs.append(gm)
-
-    logging.info(f"Structured Sub-Graphs: {structured_graphs}")
-    return structured_graphs
-
-
 class Engine:
     r"""
     Compile the provided ``train_step`` function. Then, based on the tags on
@@ -131,26 +68,82 @@ class Engine:
         self.grad_to_primal = {}
 
         self.compiled_m = None
-        self.compiled = False
-
-        def dummy_compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]):
-            print("====== dummy compile!")
-            return gm.forward
-
-        self.optimize_ctx = torchdynamo.optimize(dummy_compiler)
+        self.optimize_ctx = None
 
     def run(self, x: torch.Tensor):
-
-        if not self.compiled:
-            dummy_inputs = self.module.dummy_inputs()
-            with self.optimize_ctx:
-                for dummy_x in dummy_inputs:
-                    self.module(dummy_x)
+        if self.optimize_ctx is None:
+            self.optimize_ctx, structured_graphs = self._compile_and_extract_partial_graphs()
 
         print("==== running forward!")
         with self.optimize_ctx:
             self.module(x)
 
+    def _compile_and_extract_partial_graphs(self):
+        # HACK: get these graphs from compiler
+        # HACK: this is not a generic solution to get structured graphs, for testing
+        # purpose only
+
+        def same_activation(x, y):
+            if x.shape != y.shape or x.dtype != y.dtype or x.stride() != y.stride():
+                return False
+
+            if x.grad_fn is None and y.grad_fn is None:
+                return True
+
+            def same_autograd_graph(fn1, fn2):
+                if fn1 is None or fn2 is None:
+                    return fn1 is None and fn2 is None
+
+                next_fns1, next_fns2 = fn1.next_functions, fn2.next_functions
+                if fn1.name() != fn2.name() or len(next_fns1) != len(next_fns2):
+                    return False
+
+                for next_fn1, next_fn2 in zip(next_fns1, next_fns2):
+                    if not same_autograd_graph(next_fn1[0], next_fn2[0]):
+                        return False
+
+                return True
+
+            return same_autograd_graph(x.grad_fn, y.grad_fn)
+
+        graphs, graph_to_inputs, gid = [], {}, 0
+        def compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]):
+            nonlocal graphs, graph_to_inputs, gid
+
+            logging.info(f"Compile Sub-Graph{gid}")
+            gm.graph.print_tabular()
+            gm._siblings, gm._id, gm._inputs = [gm], gid, example_inputs
+            gid += 1
+            for prior_gm in graphs:
+                prior_inputs = graph_to_inputs[prior_gm]
+                if all([same_activation(x, y) for x, y in zip(example_inputs, prior_inputs)]):
+                    prior_gm._siblings.append(gm)
+                    gm._siblings = prior_gm._siblings
+                    logging.info(f"Found siblings Sub-Graph-{gm._id} and Sub-Graph-{prior_gm._id}")
+
+            if len(gm._siblings) <= 1:
+                graphs.append(gm)
+                graph_to_inputs[gm] = example_inputs
+
+            # TODO: add AOTAutograd
+            return gm.forward
+
+        optimize_ctx = torchdynamo.optimize(compiler)
+
+        dummy_inputs = self.module.dummy_inputs()
+        with optimize_ctx:
+            for x in dummy_inputs:
+                self.module(x)
+
+        structured_graphs = []
+        for gm in graphs:
+            if len(gm._siblings) > 1:
+                structured_graphs.append(set(gm._siblings))
+            else:
+                structured_graphs.append(gm)
+
+        logging.info(f"Structured Sub-Graphs: {structured_graphs}")
+        return optimize_ctx, structured_graphs
 
 
 # 1. how do we deal with local recompilation?
