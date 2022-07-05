@@ -247,7 +247,7 @@ class Engine:
                     states_node = gm.graph.get_attr("states")
 
                 with gm.graph.inserting_after(states_node):
-                    gm.graph.call_function(fused_allreduce, args=(states_node, bucket_id, None, last_node))
+                    gm.graph.call_function(fused_allreduce, args=(states_node, bucket_id, None, None))
 
         # 6. Erase individual allreduce node
         def erase_allreduce_node(gm):

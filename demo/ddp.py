@@ -183,10 +183,8 @@ class Engine:
             if node.op == "output":
                 # HACK: again, relying on the implicit guarantee that primals
                 # and gradient outputs follow the same order.
-                i = 0
-                for grad_node in node.args[0][:self.n_grads]:
-                    i += 1
-                    primal = f"primals_{i}"
+                for i, grad_node in enumerate(node.args[0][:self.n_grads]):
+                    primal = f"primals_{i + 1}"
                     self.grad_to_primal[grad_node.name] = primal
                     for dtag in self.primal_to_param[primal]._dtags:
                         if dtag.dttype == DTensorType.REPLICATED:
