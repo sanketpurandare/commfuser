@@ -22,11 +22,12 @@ import os
 
 
 class MyModel(nn.Module):
-    def __init__(self):
+    def __init__(self, n_features):
         super().__init__()
-        self.l1 = nn.Linear(10, 10)
-        self.l2 = nn.Linear(10, 10)
-        self.l3 = nn.Linear(10, 10)
+        self.n_features = n_features
+        self.l1 = nn.Linear(n_features, n_features)
+        self.l2 = nn.Linear(n_features, n_features)
+        self.l3 = nn.Linear(n_features, n_features)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.l1(x)
@@ -36,7 +37,7 @@ class MyModel(nn.Module):
             return self.l3(y)
 
     def dummy_inputs(self) -> List[torch.Tensor]:
-        return [torch.ones(2, 10), -torch.ones(2, 10)]
+        return [torch.ones(2, self.n_features), -torch.ones(2, self.n_features)]
 
 
 # Type of the distributed tensor
@@ -93,7 +94,7 @@ def grad_as_bucket_view(states, grad, bucket_id, offset):
     grad.data = states.buckets[bucket_id][offset:(offset + grad.numel())].view(grad.shape)
 
 
-def fused_allreduce(states, bucket_id, pg):
+def fused_allreduce(states, bucket_id, pg, blocked_by):
     logging.info(f"Fused AllReduce bucket of shape {states.buckets[bucket_id].shape}")
     dist.all_reduce(states.buckets[bucket_id], group=pg)
 
@@ -121,35 +122,36 @@ class Engine:
         # compiler this, this is addressable.
         self.train_step = train_step
         self.bucket_mb = bucket_mb
-        # HACK: today, there is no good way to map AOTAutograd primals back to
-        # parameters in the original model. The current implementation relies on
-        # the implicit AOTAutograd behavior that primals match the order of
-        # params in pytree(model.named_parameters()), and grad output in the
-        # backward graph matches the same order. So we count the number of params
-        # and use that to access primals and grads in the fwd/bwd graphs.
-        #self.n_grads = {}
         # HACK: ideally, it will be better if fx/AOTAutograd can provide a way
         # to access original param, instead of us keeping the following maps.
         self.primal_to_param = {}
         self.grad_to_primal = {}
 
-        self.compiled_m = None
         self.optimize_ctx = None
 
-        # HACK:
+        # HACK: Today, to pass non-placeholder states to fx.Nodes, we have to
+        # 1) add a submodule 2) use graph.get_attr() to retrieve this submodule.
+        # N.B.: States are required to conduct cross-subgraph fusion.
         class StatesModule(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.buckets = []
-                self.grads = []
+                self.bucket_blocked_by = []
 
         self.states = StatesModule()
 
     def run(self, x: torch.Tensor):
         if self.optimize_ctx is None:
-            self.optimize_ctx = self._compile_and_extract_partial_graphs()
+            # _compile() does the following
+            # 1. Use TorchDynamo to get individual subgraphs.
+            # 2. For each sub-graph, use AOTAutograd to insert individual AllReduce
+            # 3. After getting all subgraphs, organize them structured format
+            #    [g1, {g2, g3}], where list means ordered execution, while set
+            #    means parallel branches.
+            # 4. Process all these subgraphs together to fuse AllReduce across subgraphs.
+            self.optimize_ctx = self._compile()
 
-        print("==== running forward!")
+        # Dynamo's context caches compiled graph. Use it for real execution.
         with self.optimize_ctx:
             out = self.module(x)
 
@@ -161,13 +163,11 @@ class Engine:
         bucket_mb: int,
         structured_bwd_gms: List[Union[fx.GraphModule, Set[fx.GraphModule]]]
     ):
-        print("111111111")
-        ordered_bwd_gms = [[x] if isinstance(x, fx.GraphModule) else list(x) for x in structured_bwd_gms]
+        ordered_bwd_gms = [[x] if isinstance(x, fx.GraphModule) else list(x) for x in reversed(structured_bwd_gms)]
 
-        # normalized allreduce, similar to DDP
+        # normalize allreduce, similar to DDP
         bucket_id, bucket_size, pg = 0, 0, None
         for phase in ordered_bwd_gms:
-            print("22222222")
             starting_bucket_id = bucket_id
             for gm in phase:
                 # fuse allreduce ops based on bucket_mb
@@ -175,51 +175,69 @@ class Engine:
                     # HACK: allreduce is a custom Python function for now. It will be
                     # more readable if we convert it into an ATen operator
                     if node.name.startswith("allreduce"):
-                        # 1. build bucket
+                        # 1. record bucket size and bucket offset for this grad
                         primal = self.grad_to_primal[gm._id][node.args[0].name]
                         offset = bucket_size
                         bucket_size += self.primal_to_param[gm._id][primal].numel()
 
-                        # 2. insert copy_to_bucket node
-                        # NB: bucket is not ready, but we can insert node
+                        # 2. insert grad_as_bucket_view node. Note that we need
+                        # to first insert a get_attr node to retrieve the
+                        # cross-sub-graph states which keeps buckets info.
+                        #
+                        # N.B.: bucket is not created yet, as this is still at
+                        # compile time. However, we can already insert this node,
+                        # because buckets will be ready at runtime.
                         with gm.graph.inserting_after(node):
                             states_node = gm.graph.get_attr("states")
 
                         with gm.graph.inserting_after(states_node):
-                            gm.graph.call_function(
+                            param = self.primal_to_param[gm._id][primal]
+                            grad_as_view_node = gm.graph.call_function(
                                 grad_as_bucket_view,
                                 args=(states_node, node.args[0], bucket_id, offset)
                             )
 
-
-
-                        # 3. remember the blocking allreduce for the bucket
+                        # 3. remember the blocking grad_as_view_node for the
+                        # allreduce of this bucket.
                         if bucket_size >= self.bucket_mb * 1e6:
                             self.states.buckets.append(torch.zeros(bucket_size))
-                            self.states.bucket_blocked_by.append((gm, node))
+                            self.states.bucket_blocked_by.append((gm, grad_as_view_node))
                             bucket_size = 0
                             bucket_id += 1
 
-            # 4. insert same sequence of buckets for all branches
+            # 4. insert the ame sequence of buckets fused allreduce for all branches
+            # If the allreduce is not blocked by any node in the current gm, insert
+            #    it after the first node.
+            # If the allreduce is blocked some node in the current gm, insert it
+            #    right after the blocking node.
             for gm in phase:
                 last_node = next(iter(gm.graph.nodes))
                 for i, bucket in enumerate(self.states.buckets[starting_bucket_id:]):
                     curr_bucket_id = starting_bucket_id + i
-                    blocked_by_gm, block_by_node = self.states.bucket_blocked_by[curr_bucket_id]
+                    blocked_by_gm, blocked_by_node = self.states.bucket_blocked_by[curr_bucket_id]
                     if gm != blocked_by_gm:
                         with gm.graph.inserting_after(last_node):
                             states_node = gm.graph.get_attr("states")
 
                         with gm.graph.inserting_after(states_node):
-                            last_node = gm.graph.call_function(fused_allreduce, args=(states_node, curr_bucket_id, None))
+                            last_node = gm.graph.call_function(
+                                fused_allreduce,
+                                args=(states_node, curr_bucket_id, None, last_node)
+                            )
                     else:
                         with gm.graph.inserting_after(blocked_by_node):
                             states_node = gm.graph.get_attr("states")
 
                         with gm.graph.inserting_after(states_node):
-                            last_node = gm.graph.call_function(fused_allreduce, args=(states_node, curr_bucket_id, None))
+                            last_node = gm.graph.call_function(
+                                fused_allreduce,
+                                args=(states_node, curr_bucket_id, None, blocked_by_node)
+                            )
 
-        # 5. process remaining grads
+        # 5. process remaining grads. Create a bucket for the remaining grads
+        # and insert it before the last node, which should be the output node.
+        # Have to do this for all GraphModules in the last phase, otherwise it
+        # can hang.
         if bucket_size > 0:
             self.states.buckets.append(torch.zeros(bucket_size))
             for gm in ordered_bwd_gms[-1]:
@@ -229,9 +247,9 @@ class Engine:
                     states_node = gm.graph.get_attr("states")
 
                 with gm.graph.inserting_after(states_node):
-                    gm.graph.call_function(fused_allreduce, args=(states_node, bucket_id, None))
+                    gm.graph.call_function(fused_allreduce, args=(states_node, bucket_id, None, last_node))
 
-        # t. erase individual allreduce node
+        # 6. Erase individual allreduce node
         def erase_allreduce_node(gm):
             nodes_to_erase = []
             for node in gm.graph.nodes:
@@ -241,14 +259,14 @@ class Engine:
             for node in nodes_to_erase:
                 gm.graph.erase_node(node)
 
+        # 7. Recompile every sub-graph. This is inplace. So, it will update the
+        # cached graphs in compiler contexts.
         for phase in ordered_bwd_gms:
             for gm in phase:
-                print("3333333")
                 erase_allreduce_node(gm)
                 gm.graph.lint()
                 gm.recompile()
                 gm.graph.print_tabular()
-
 
 
     def _aot_compile_fwd(self, gid: int, dynamo_fwd_gm: fx.GraphModule):
@@ -257,8 +275,8 @@ class Engine:
 
             def to_param(model: nn.Module, primal_name: str) -> torch.nn.Parameter:
                 idx = int(primal_name.split("_")[-1]) - 1
-                params = [p for _, p in list(pytree.tree_flatten(model.named_parameters())[0][0])]
-                #print(f"????? {idx}, {len(params)}")
+                # HACK: Dynamo primal order is the reverse of AOTAutograd???
+                params = [p for _, p in reversed(list(pytree.tree_flatten(model.named_parameters())[0][0]))]
                 return params[idx] if idx < len(params) else None
 
             # get tags on each param
@@ -271,30 +289,34 @@ class Engine:
                         )
                         # HACK: use sub-graph gid to distinguish primals with the same name
                         self.primal_to_param[gid][node.target] = p
-                        #print(f"++++ inserted {gid}, {node.target}")
 
             logging.info(
                 f"\nCompiled SubGraph-{gid} forward, identified following Distributed Tensors\n" +
                 "\n".join([f"{pl} : {pm._dtags}" for pl, pm in self.primal_to_param[gid].items()])
             )
 
-            gm._id = gid
-            dynamo_fwd_gm._aot_fwd_graph = gm
             return gm
         return compile_fwd
 
     def _aot_compile_bwd(self, gid: int, dynamo_fwd_gm: fx.GraphModule):
         def compile_bwd(gm: fx.GraphModule, inps) -> fx.GraphModule:
+            # HACK: AOTAutograd's GraphModule does not provide a .parameters()
+            # member method. Therefore, have to use dynamo's GraphModule to
+            # access original parameters.
             nonlocal gid, dynamo_fwd_gm
 
+            # HACK: today, there is no good way to map AOTAutograd primals back to
+            # parameters in the original model. The current implementation relies on
+            # the implicit AOTAutograd behavior that primals match the order of
+            # params in pytree(model.named_parameters()), and grad output in the
+            # backward graph matches the same order. So we count the number of params
+            # and use that to access primals and grads in the fwd/bwd graphs.
             n_grads = sum([p.requires_grad for p in dynamo_fwd_gm.parameters()])
 
             logging.info("Compiling backward")
             logging.info("Original backward graph")
             gm.graph.print_tabular()
-            # insert individual allreduce
-            pgs = {}
-
+            # insert individual allreduce. This can be done within each subgraph
             gm.add_submodule("states", self.states)
             for node in gm.graph.nodes:
                 if node.op == "output":
@@ -307,7 +329,6 @@ class Engine:
                             if dtag.dttype == DTensorType.REPLICATED:
                                 with gm.graph.inserting_after(grad_node):
                                     gm.graph.call_function(allreduce, args=(grad_node, dtag.pg))
-                                    pgs[grad_node] = dtag.pg
                     break
 
             gm.graph.lint()
@@ -315,18 +336,18 @@ class Engine:
             logging.info("Modified backward graph")
             gm.graph.print_tabular()
 
-            logging.info("finished compiling backward")
-
+            # HACK: Remember individual sub-graphs. Later, will use these to do
+            # global fusion across sub-graphs
             gm._id = gid
             dynamo_fwd_gm._aot_bwd_graph = gm
             return gm
         return compile_bwd
 
-    def _compile_and_extract_partial_graphs(self):
-        # HACK: get these graphs from compiler
-        # HACK: this is not a generic solution to get structured graphs, for testing
-        # purpose only
-
+    def _compile(self):
+        # HACK: check if the graph that produces the activations are the same.
+        # We use this hack to check whether two subgraphs are sibling branches.
+        # This is not a generic solution. It might be a lot easier to do this
+        # within TorchDyanmo.
         def same_activation(x, y):
             if x.shape != y.shape or x.dtype != y.dtype or x.stride() != y.stride():
                 return False
@@ -350,6 +371,8 @@ class Engine:
 
             return same_autograd_graph(x.grad_fn, y.grad_fn)
 
+        # HACK: compiler for Dyanmo. Record all graphs compiled and save them for
+        # global fusion.
         graphs, graph_to_inputs, gid = [], {}, 0
         def compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]):
             nonlocal graphs, graph_to_inputs, gid
@@ -372,19 +395,20 @@ class Engine:
                 graphs.append(gm)
                 graph_to_inputs[gm] = example_inputs
 
-            #print(f"=== dynamo submodule parameters {list(gm.parameters())}")
+            # Calling AOTAutograd to insert individual allreduce
             compiled_m = aot_module(gm, self._aot_compile_fwd(gid, gm), self._aot_compile_bwd(gid, gm))
             gid += 1
             return compiled_m
-            #return gm.forward
 
         optimize_ctx = torchdynamo.optimize(compiler)
 
+        # HACK: use dummy inputs to extract all subgraphs.
         dummy_inputs = self.module.dummy_inputs()
         with optimize_ctx:
             for x in dummy_inputs:
                 self.module(x)
 
+        # HACK: retrieve backward graphs and organize them in a structured way
         structured_graphs = []
         for gm in graphs:
             if len(gm._siblings) > 1:
@@ -392,19 +416,11 @@ class Engine:
             else:
                 structured_graphs.append(gm._aot_bwd_graph)
 
+        # HACK: fuse allreduces across sub-graphs
         self._fuse_allreduce(self.bucket_mb, structured_graphs)
 
         logging.info(f"Structured Sub-Graphs: {structured_graphs}")
         return optimize_ctx
-
-
-# 1. how do we deal with local recompilation?
-# 2. can we fuse across partial graphs?
-#
-# advantages:
-# 1. we deterministically know which are model params as we come from DDP/FSDP
-# 2. isolate comm executor?
-
 
 
 ################################################################################
@@ -412,6 +428,7 @@ class Engine:
 # Note that these are the user-facing APIs for ML practitioners. There will be #
 # another user-facing API at the DistributedTensor level for ML system         #
 # develoeprs.                                                                  #
+# N.B.: APIs below is NOT the final proposal                                     #
 ################################################################################
 
 
@@ -425,32 +442,31 @@ def run_worker(rank, world_size):
     logging.getLogger().setLevel(logging.DEBUG if rank == 0 else logging.CRITICAL)
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
-    n_features = 10000
+    n_features = 1000
     # create local model on CPU
-    model = MyModel()
+    model = MyModel(n_features)
     # tag all parameters as replicated tensor
     model = DDP(model)
     # we should be able to support the following as well
     # DDP(FSDP(model, pg=intra_node), pg=inter_node)
 
     # compile train_step, insert comm ops based on tags in model, and fuse them
-    engine = Engine(model, train_step)
-    engine.run(torch.zeros(2, 10))
-    engine.run(torch.ones(2, 10))
-    engine.run(-torch.ones(2, 10))
+    engine = Engine(model, train_step, bucket_mb=1)
+    for batch in [
+        torch.zeros(2, n_features),
+        torch.ones(2, n_features),
+        -torch.ones(2, n_features)
+    ]:
+        engine.run(batch)
 
-    #get_partial_graphs(model)
 
 
 
 if __name__=="__main__":
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29500"
-    world_size = 1
-    """
+    world_size = 2
     mp.spawn(run_worker,
         args=(world_size,),
         nprocs=world_size,
         join=True)
-    """
-    run_worker(0, 1)
