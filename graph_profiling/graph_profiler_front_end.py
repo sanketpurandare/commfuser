@@ -1,6 +1,6 @@
 import logging
 from typing import Any, Callable, Dict, List, Optional
-
+import functorch
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,9 +10,17 @@ from graph_profiler import GraphProfiler, GraphType
 from torch import fx
 from torch.profiler import profile, record_function, ProfilerActivity, schedule
 from torchbenchmark.util.benchmark_utils import get_benchmark_model
-
+# torchdynamo.config.capture_scalar_outputs = True
 FORWARD = GraphType.forward
 BACKWARD = GraphType.backward
+class SaveToCpu(nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args, **kwargs):
+        with torch.autograd.graph.save_on_cpu(pin_memory=True):
+            return self.module(*args, **kwargs)
 
 
 class ProfileEngine:
@@ -94,16 +102,19 @@ class ProfileEngine:
                                 wait=1,
                                 warmup=warm_up_iters,
                                 active=profile_iters)
+        exit()
         logging.info("Profling...")
         init_prof = False
         with profile(activities=[
         ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True, schedule=my_schedule) as prof:
             if(not init_prof):
                 for prof_dict in self.profilers.values():
-                    fwd_profiler: GraphProfiler = prof_dict[FORWARD]
-                    bwd_profiler: GraphProfiler = prof_dict[BACKWARD]
-                    fwd_profiler.torch_profiler = prof
-                    bwd_profiler.torch_profiler = prof
+                    fwd_profiler: GraphProfiler = prof_dict.get(FORWARD, None)
+                    bwd_profiler: GraphProfiler = prof_dict.get(BACKWARD, None)
+                    if(fwd_profiler is not None):
+                        fwd_profiler.torch_profiler = prof
+                    if(bwd_profiler is not None):
+                        bwd_profiler.torch_profiler = prof
 
             for _ in range(2+warm_up_iters+profile_iters):
                 with self.profile_ctx:
@@ -119,10 +130,12 @@ class ProfileEngine:
         iterations and makes them ready for printing.
         """
         for prof_dict in self.profilers.values():
-            fwd_profiler: GraphProfiler = prof_dict[FORWARD]
-            bwd_profiler: GraphProfiler = prof_dict[BACKWARD]
-            fwd_profiler.summarize()
-            bwd_profiler.summarize()
+            fwd_profiler: GraphProfiler = prof_dict.get(FORWARD, None)
+            bwd_profiler: GraphProfiler = prof_dict.get(BACKWARD, None)
+            if(fwd_profiler is not None):
+                fwd_profiler.summarize()
+            if(bwd_profiler is not None):
+                bwd_profiler.summarize()
 
     def reset_stats(self):
         r"""
@@ -130,10 +143,12 @@ class ProfileEngine:
         warm-up iterations or before beginning a new profiling session.
         """
         for prof_dict in self.profilers.values():
-            fwd_profiler: GraphProfiler = prof_dict[FORWARD]
-            bwd_profiler: GraphProfiler = prof_dict[BACKWARD]
-            fwd_profiler.reset_stats()
-            bwd_profiler.reset_stats()
+            fwd_profiler: GraphProfiler = prof_dict.get(FORWARD, None)
+            bwd_profiler: GraphProfiler = prof_dict.get(BACKWARD, None)
+            if(fwd_profiler is not None):
+                fwd_profiler.reset_stats()
+            if(bwd_profiler is not None):
+                bwd_profiler.reset_stats()
 
     def print_summary(self) -> str:
         r"""
@@ -143,12 +158,15 @@ class ProfileEngine:
         """
         self._summary()
         for gid, prof_dict in self.profilers.items():
-            fwd_profiler: GraphProfiler = prof_dict[FORWARD]
-            logging.info(f"Forward Graph {gid} Summary: ")
-            print(fwd_profiler.print_summary())
-            bwd_profiler: GraphProfiler = prof_dict[BACKWARD]
-            logging.info(f"Backward Graph {gid} Summary: ")
-            print(bwd_profiler.print_summary())
+            fwd_profiler: GraphProfiler = prof_dict.get(FORWARD, None)
+            bwd_profiler: GraphProfiler = prof_dict.get(BACKWARD, None)
+            if(fwd_profiler is not None):
+                logging.info(f"Forward Graph {gid} Summary: ")
+                print(fwd_profiler.print_summary())
+            if(bwd_profiler is not None):
+                logging.info(f"Backward Graph {gid} Summary: ")
+                print(bwd_profiler.print_summary())
+
 
     def _aot_compile_fwd(self, dynamo_fwd_gm: fx.GraphModule):
         # Wraps the forward compiler for the aot_module. 
@@ -195,7 +213,10 @@ class ProfileEngine:
                 gm, BACKWARD, fwd_profiler=fwd_profiler
             )
             self.profilers[dynamo_fwd_gm._id][BACKWARD] = bwd_profiler
-            return bwd_profiler.meta_run
+            def dummy_f(args):
+                return bwd_profiler.meta_run(args)
+            dummy_f._boxed_call = True
+            return dummy_f
 
         return compile_bwd
 
@@ -218,8 +239,13 @@ class ProfileEngine:
                 if node.op == "output":
                     for _ in node.args[0]:
                         output_count += 1
+            # gm = SaveToCpu(gm)
+            print(f"Graph ID: {gid}")
+
             gm._id, gm._num_outs = gid, output_count
+
             self.profilers[gid] = {}
+            
             compiled_m = aot_module(
                 gm, self._aot_compile_fwd(gm), self._aot_compile_bwd(gm)
             )
@@ -227,8 +253,8 @@ class ProfileEngine:
             return compiled_m
 
         optimize_ctx = torchdynamo.optimize(dynamo_compiler)
-        with optimize_ctx:
-            self.forward_loss(self.model, self.example_inputs)
+
+        self.forward_loss(optimize_ctx(self.model), self.example_inputs).backward()
 
         return optimize_ctx
 
@@ -237,16 +263,16 @@ if __name__ == "__main__":
 
     logging.getLogger().setLevel(logging.DEBUG)
 
-    model_name = "torchbenchmark.models.hf_Bert.Model"
-    batch_size = 24
+    model_name = "torchbenchmark.models.hf_GPT2_large.Model"
+    batch_size = 2
     device = torch.device("cuda")
     model, forward_loss, optimizer, example_inputs = get_benchmark_model(
         model_name, batch_size=batch_size, device=device
     )
 
     engine = ProfileEngine(model, forward_loss, optimizer, example_inputs,
-                             "swap")
+                             "default")
 
     engine.run(warm_up_iters=2, profile_iters=3)
     
-    engine.print_summary()
+    # engine.print_summary()

@@ -254,13 +254,11 @@ class GraphProfiler(Interpreter):
                     map_arg(node.kwargs, lambda n: register_first_backward_use(n, node))
 
     def meta_run(self, args_list: List[Any]) -> Any:
-        new_args = self.module.graph.process_inputs(args_list)
-        args_iter = iter(new_args)
+        args_iter = iter(args_list)
         for n in self.module.graph.nodes:
             if n.op == "placeholder":
                 self.env[n] = next(args_iter)
         args_list.clear()
-        del new_args
         return self.run([])
 
     def run(self, *args) -> Any:
