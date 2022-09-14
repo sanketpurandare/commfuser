@@ -2,7 +2,7 @@ from decimal import MAX_EMAX
 from enum import Enum, auto
 from typing import List, Set, Union
 from torch import fx
-from scheduling_policy.scheduling_policies import SchedulingPolicy
+from scheduling.scheduling_policies import SchedulingPolicy
 import torch
 import logging
 import os
