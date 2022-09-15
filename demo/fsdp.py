@@ -1,37 +1,40 @@
-from functorch.compile import aot_function, aot_module, draw_graph
-from torch import nn
-from torch.distributed import ProcessGroup
+import logging
+import math
+import os
+from dataclasses import dataclass
+from enum import Enum
+from enum import auto
+from functools import partial
+from functools import reduce
+from typing import Any
+from typing import Callable
+from typing import Dict
+from typing import List
+from typing import Optional
+from typing import Set
 
 import torch
 import torch.distributed as dist
 import torch.fx as fx
 import torch.multiprocessing as mp
 import torch.utils._pytree as pytree
-
-from dataclasses import dataclass
-from enum import Enum, auto
-from functools import partial, reduce
-from typing import (
-    Any,
-    Callable,
-    List,
-    Dict,
-    Optional,
-    Set,
-)
-
-import logging
-import math
-import os
+from functorch.compile import aot_function
+from functorch.compile import aot_module
+from functorch.compile import draw_graph
+from torch import nn
+from torch.distributed import ProcessGroup
 
 
 class MyModel(nn.Module):
     def __init__(self, n_features, n_layers):
         super().__init__()
-        self.seq = nn.Sequential(*[nn.Linear(n_features, n_features) for _ in range(n_layers)])
+        self.seq = nn.Sequential(
+            *[nn.Linear(n_features, n_features) for _ in range(n_layers)]
+        )
 
     def forward(self, x):
         return self.seq(x)
+
 
 # Type of the distributed tensor
 class DTensorType(Enum):
@@ -62,7 +65,8 @@ class FSDP(nn.Module):
     """
     Tag each param as ondemand
     """
-    def __init__(self, module: nn.Module, pg: ProcessGroup=None):
+
+    def __init__(self, module: nn.Module, pg: ProcessGroup = None):
         super().__init__()
         self.module = module
 
@@ -80,7 +84,9 @@ def ondemand_allgather(param, pg):
     orig_size = param._orig_size
     with torch.no_grad():
         world_size = dist.get_world_size(group=pg)
-        buffer = torch.empty([world_size] + list(local_shard.shape), device=param.device)
+        buffer = torch.empty(
+            [world_size] + list(local_shard.shape), device=param.device
+        )
         tensors = [buffer[i] for i in range(world_size)]
         # HACK: using synchronous allgather to demonstrate feasibility. This
         # should be asynchronous in the final stack.
@@ -109,7 +115,7 @@ def ondemand_reducescatter(grad, pg):
         padded_size = int(math.ceil(grad.numel() / world_size))
         output = torch.empty([padded_size], device=grad.device)
         inputs_tensor = torch.empty([padded_size * world_size], device=grad.device)
-        inputs_tensor[:grad.numel()].copy_(grad.view(-1))
+        inputs_tensor[: grad.numel()].copy_(grad.view(-1))
         inputs = list(inputs_tensor.chunk(world_size))
         dist.reduce_scatter(output, inputs, group=pg)
         return output
@@ -129,6 +135,7 @@ class Engine:
                                ``Engine`` will joinly optimize the entire
                                ``train_step``.
     """
+
     def __init__(self, module: nn.Module, train_step: Callable):
         # HACK: Meta device tracing is not ready. Have to create the module on
         # CPU for now.
@@ -149,7 +156,9 @@ class Engine:
         self.view_to_parent = {}
         self.primal_to_param = {}
         self.grad_to_primal = {}
-        self.pytree_params = [p for _, p in list(pytree.tree_flatten(module.named_parameters())[0][0])]
+        self.pytree_params = [
+            p for _, p in list(pytree.tree_flatten(module.named_parameters())[0][0])
+        ]
         self.pytree_params.reverse()
 
         self.compiled_m = None
@@ -167,15 +176,17 @@ class Engine:
 
     def run(self, x: torch.Tensor):
         if self.compiled_m is None:
-            self.compiled_m = aot_module(self.module, self._compile_fwd, self._compile_bwd)
+            self.compiled_m = aot_module(
+                self.module, self._compile_fwd, self._compile_bwd
+            )
 
         if self.fwd_gm is None or self.bwd_gm is None:
             # HACK: AOTAutograd cannot trace the train_step yet, so compile the
             # module for now.
             self.compiled_m(x)
-            assert self.fwd_gm is not None and self.bwd_gm is not None, (
-                "Forward and backward GraphModules are not generated."
-            )
+            assert (
+                self.fwd_gm is not None and self.bwd_gm is not None
+            ), "Forward and backward GraphModules are not generated."
 
         # HACK: Have to directly call fwd and bwd GraphModule to avoid
         # recompilation. Ideally, it will be helpful to control which guards
@@ -195,7 +206,7 @@ class Engine:
             buffer = torch.empty([padded_size], device=param.device)
             offset = rank * padded_size
             to = min(offset + padded_size, param.numel())
-            buffer[:(to - offset)] = param.view(-1)[offset : to]
+            buffer[: (to - offset)] = param.view(-1)[offset:to]
             param._local_shard = buffer
             param._orig_size = param.size()
             # HACK: cannot set param.data to the shard yet, because AOTAutograd
@@ -204,22 +215,28 @@ class Engine:
 
     # Find all views of a parameter, and return a dict that maps child view to
     # parent view.
-    def _find_primal_views(self, gm: fx.GraphModule, primal: fx.Node) -> Dict[fx.Node, fx.Node]:
+    def _find_primal_views(
+        self, gm: fx.GraphModule, primal: fx.Node
+    ) -> Dict[fx.Node, fx.Node]:
         view_to_parent = {primal: primal}
         for node in gm.graph.nodes:
-            if all([
-                node.op == "call_function" and
-                str(node.target) == "aten.t" and
-                len(node.args) == 1 and
-                node.args[0] in view_to_parent
-            ]):
+            if all(
+                [
+                    node.op == "call_function"
+                    and str(node.target) == "aten.t"
+                    and len(node.args) == 1
+                    and node.args[0] in view_to_parent
+                ]
+            ):
                 view_to_parent[node] = node.args[0]
 
         return view_to_parent
 
     # Find all usages on parameter and its views in the graph. This later helps
     # to insert allgather before first usage and discard after the last usage
-    def _find_param_usages(self, gm: fx.GraphModule, views: Set[fx.Node]) -> List[fx.Node]:
+    def _find_param_usages(
+        self, gm: fx.GraphModule, views: Set[fx.Node]
+    ) -> List[fx.Node]:
         usages = []
         for node in gm.graph.nodes:
             for view in views:
@@ -230,31 +247,30 @@ class Engine:
 
     # For one parameter primal, insert allgather before first usage, and discard
     # after the last usage.
-    def _handle_one_param_primal(self, gm: fx.GraphModule, primal: fx.Node, pg: ProcessGroup):
+    def _handle_one_param_primal(
+        self, gm: fx.GraphModule, primal: fx.Node, pg: ProcessGroup
+    ):
         views = self._find_primal_views(gm, primal)
         self.view_to_parent.update(views)
         usages = self._find_param_usages(gm, set(views.keys()))
 
         # insert allgather before first usage
         with gm.graph.inserting_before(usages[0]):
-            new_node = gm.graph.call_function(
-                ondemand_allgather,
-                args=(primal, pg)
-            )
+            new_node = gm.graph.call_function(ondemand_allgather, args=(primal, pg))
             usages[0].replace_input_with(primal, new_node)
 
         # insert reshard after last usage
         with gm.graph.inserting_after(usages[-1]):
-            gm.graph.call_function(
-                ondemand_discard,
-                args=(primal, usages[-1]))
+            gm.graph.call_function(ondemand_discard, args=(primal, usages[-1]))
 
     def _compile_fwd(self, gm: fx.GraphModule, inps):
         # HACK: use pytree order of params to map to primals, and save the info
         # for compile_bwd.
         def to_param(model: nn.Module, primal_name: str) -> torch.nn.Parameter:
             idx = int(primal_name.split("_")[-1]) - 1
-            params = [p for _, p in list(pytree.tree_flatten(model.named_parameters())[0][0])]
+            params = [
+                p for _, p in list(pytree.tree_flatten(model.named_parameters())[0][0])
+            ]
             return params[idx] if idx < len(params) else None
 
         logging.info("Compiling forward")
@@ -264,9 +280,9 @@ class Engine:
             if node.op == "placeholder" and node.target.startswith("primal"):
                 p = to_param(self.module, node.name)
                 if p is not None and hasattr(p, "_dtags"):
-                    assert node.target not in self.primal_to_param, (
-                        f"inserting {node.target} twice"
-                    )
+                    assert (
+                        node.target not in self.primal_to_param
+                    ), f"inserting {node.target} twice"
                     self.primal_to_param[node.target] = p
 
                     for tag in p._dtags:
@@ -290,11 +306,11 @@ class Engine:
                         new_args[0].append(arg)
                 node.args = new_args
 
-
-
         logging.info(
-            "\nFinished compiling forward, identified following Distributed Tensors\n" +
-            "\n".join([f"{pl} : {pm._dtags}" for pl, pm in self.primal_to_param.items()])
+            "\nFinished compiling forward, identified following Distributed Tensors\n"
+            + "\n".join(
+                [f"{pl} : {pm._dtags}" for pl, pm in self.primal_to_param.items()]
+            )
         )
 
         gm.graph.lint()
@@ -340,11 +356,17 @@ class Engine:
                 with gm.graph.inserting_before(node):
                     for to_insert in node_to_insert:
                         for arg in to_insert.args:
-                            new_node = gm.graph.node_copy(arg, arg_transform=arg_transform)
+                            new_node = gm.graph.node_copy(
+                                arg, arg_transform=arg_transform
+                            )
                             new_nodes[arg.name] = new_node
-                        new_node = gm.graph.node_copy(to_insert, arg_transform=arg_transform)
+                        new_node = gm.graph.node_copy(
+                            to_insert, arg_transform=arg_transform
+                        )
                         new_nodes[to_insert.name] = new_node
-                        param_primal = new_node if new_node.op == "placeholder" else param_primal
+                        param_primal = (
+                            new_node if new_node.op == "placeholder" else param_primal
+                        )
 
                 node.replace_all_uses_with(new_node)
 
@@ -354,8 +376,8 @@ class Engine:
 
                 with gm.graph.inserting_after(usages[-1]):
                     gm.graph.call_function(
-                        ondemand_discard,
-                        args=(param_primal, usages[-1]))
+                        ondemand_discard, args=(param_primal, usages[-1])
+                    )
 
                 # erase original view node
                 gm.graph.erase_node(node)
@@ -370,7 +392,7 @@ class Engine:
                 # HACK: again, relying on the implicit guarantee that primals
                 # and gradient outputs follow the same order.
                 i = 0
-                for grad_node in node.args[0][:self.n_grads]:
+                for grad_node in node.args[0][: self.n_grads]:
                     i += 1
                     primal = f"primals_{i}"
                     self.grad_to_primal[grad_node.name] = primal
@@ -378,13 +400,12 @@ class Engine:
                         if dtag.dttype == DTensorType.ONDEMAND:
                             with gm.graph.inserting_after(grad_node):
                                 new_grad_node = gm.graph.call_function(
-                                    ondemand_reducescatter,
-                                    args=(grad_node, dtag.pg)
+                                    ondemand_reducescatter, args=(grad_node, dtag.pg)
                                 )
 
                                 new_output_args.append(new_grad_node)
 
-                new_output_args.extend(node.args[0][self.n_grads:])
+                new_output_args.extend(node.args[0][self.n_grads :])
                 node.args = new_output_args
                 break
 
@@ -444,12 +465,9 @@ def run_worker(rank, world_size):
     #   train_step(model, x)
 
 
-if __name__=="__main__":
+if __name__ == "__main__":
 
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29500"
     world_size = 2
-    mp.spawn(run_worker,
-        args=(world_size,),
-        nprocs=world_size,
-        join=True)
+    mp.spawn(run_worker, args=(world_size,), nprocs=world_size, join=True)

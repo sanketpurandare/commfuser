@@ -1,43 +1,58 @@
 import logging
 import statistics
-from typing import Any, Dict, Iterator, List, Optional, Tuple
-from torch.profiler import record_function
+from typing import Any
+from typing import Dict
+from typing import Iterator
+from typing import List
+from typing import Optional
+from typing import Tuple
+
 import tabulate
 import torch
+from graph_profiler_utils import DEVICE
+from graph_profiler_utils import MEM_LIMIT
+from graph_profiler_utils import BiDict
+from graph_profiler_utils import GraphProfiler
+from graph_profiler_utils import GraphType
+from graph_profiler_utils import IntNodeInfo
+from graph_profiler_utils import NodeInfo
+from graph_profiler_utils import ProfileMode
+from graph_profiler_utils import TensorStatus
+from graph_profiler_utils import get_tensor_stat
+from graph_profiler_utils import profile_mode_dict
 from torch.autograd.profiler_util import EventList
-from graph_profiler_utils import (MEM_LIMIT, DEVICE, BiDict, GraphProfiler, GraphType,
-                                IntNodeInfo, NodeInfo, ProfileMode,
-                                TensorStatus, get_tensor_stat,
-                                profile_mode_dict)
-from torch.fx import GraphModule, Interpreter, Node
+from torch.fx import GraphModule
+from torch.fx import Interpreter
+from torch.fx import Node
 from torch.fx.node import map_arg
+from torch.profiler import record_function
 
 
 class GraphProfiler(Interpreter):
-    r""" The main GraphProfiler class that extends the fx.Interpreter and runs
+    r"""The main GraphProfiler class that extends the fx.Interpreter and runs
     the input graph module node by node, collecting profiling information for
-    each one of them. 
-    Args: 
-    graphmod (fx.GraphModule): The fx graphmodule to initialize the 
-                                GraphProfiler. 
-    gtype (GraphType): The type of fx graph module (forward/backward) 
+    each one of them.
+    Args:
+    graphmod (fx.GraphModule): The fx graphmodule to initialize the
+                                GraphProfiler.
+    gtype (GraphType): The type of fx graph module (forward/backward)
     fwd_profiler (GraphProfiler): To intialize the backward
-                                profiler, an instance of forward profiler is 
-                                required. It is used to create a mapping from 
-                                nodes of forward graph to the backward graph, 
-                                merge the profiling information from forward 
-                                and backward graphs into a single dictionary 
-                                and use the attributes of the fwd_profiler. 
+                                profiler, an instance of forward profiler is
+                                required. It is used to create a mapping from
+                                nodes of forward graph to the backward graph,
+                                merge the profiling information from forward
+                                and backward graphs into a single dictionary
+                                and use the attributes of the fwd_profiler.
     fw_num_outs (int): The number of outputs in the original dynamo graph used
-                        to generate the aot_graphs.  
-    sync (bool): Flag to indicate whether the cuda stream should be 
-                synchronized for each node operation.  
+                        to generate the aot_graphs.
+    sync (bool): Flag to indicate whether the cuda stream should be
+                synchronized for each node operation.
     profile_mode (str): The Graph Profiler provides three profiling
                         modes,``default``, ``memory`` and ``swap``.
 
-    Dictionaries: 
+    Dictionaries:
     node_info (Dict[fx.Node, NodeInfo]): Dictionary to store the
-                                        mapping of the node 
+                                        mapping of the node
                                         to its NodeInfo object (Profiling
                                         Information)
     fwd_bwd_map (BiDict[fx.Node, fx.Node]): Bidirectional Dictionary to store
@@ -47,8 +62,9 @@ class GraphProfiler(Interpreter):
                                         pass for gradient calculation in the
                                         backward pass that are not a part of the
                                         forward graph output in the original
-                                        dynamo graph.  
-    """ 
+                                        dynamo graph.
+    """
+
     def __init__(
         self,
         graphmod: GraphModule,
@@ -60,12 +76,12 @@ class GraphProfiler(Interpreter):
     ):
         super().__init__(graphmod, True)
         self.gtype: GraphType = gtype
-        self.id:int = graphmod._id
+        self.id: int = graphmod._id
         torch.cuda.reset_peak_memory_stats()
         if self.gtype == GraphType.backward:
             logging.info("Initializing Backward Profiler")
             assert fwd_profiler is not None
-            self.prefix_str:str = f"g{self.id}_bw"
+            self.prefix_str: str = f"g{self.id}_bw"
             self.sync: bool = fwd_profiler.sync
             self.node_info: Dict[Node, NodeInfo] = fwd_profiler.node_info
             self.fwd_intermediate_nodes: List[Node] = fwd_profiler.intermediate_nodes
@@ -76,7 +92,7 @@ class GraphProfiler(Interpreter):
             self.profile_mode: ProfileMode = fwd_profiler.profile_mode
         else:
             logging.info("Initializing Forward Profiler")
-            self.prefix_str:str = f"g{self.id}_fw"
+            self.prefix_str: str = f"g{self.id}_fw"
             self.sync: bool = sync
             self.node_info: Dict[Node, NodeInfo] = {}
             self.fwd_intermediate_nodes: List[Node] = []
@@ -90,10 +106,10 @@ class GraphProfiler(Interpreter):
         self.node_peak_mem: Dict[Node, List[int]] = {}
         self.runtimes_sec: Dict[Node, float] = {}
         self.swaptimes_sec: Dict[Node, float] = {}
-        self.node_cuda_time:Dict[Node, float] = {}
-        self.node_cpu_time:Dict[Node, float] = {}
-        self.node_cuda_swaptime:Dict[Node, float] = {}
-        self.node_cpu_swaptime:Dict[Node, float] = {}
+        self.node_cuda_time: Dict[Node, float] = {}
+        self.node_cpu_time: Dict[Node, float] = {}
+        self.node_cuda_swaptime: Dict[Node, float] = {}
+        self.node_cpu_swaptime: Dict[Node, float] = {}
         self.intermediate_nodes: List[Node] = []
         self.torch_profiler: torch.profiler.profile = None
         self.env = {}
@@ -264,7 +280,7 @@ class GraphProfiler(Interpreter):
     def run(self, *args) -> Any:
         return_val = super().run(*args, initial_env=self.env)
         args = None
-        if(self.gtype == GraphType.backward):
+        if self.gtype == GraphType.backward:
             torch.cuda.synchronize()
         self.env = {}
         return return_val
@@ -301,7 +317,7 @@ class GraphProfiler(Interpreter):
                         if self.sync:
                             torch.cuda.synchronize()
 
-        if(self.profile_mode in [ProfileMode.swap, ProfileMode.memory]):
+        if self.profile_mode in [ProfileMode.swap, ProfileMode.memory]:
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.reset_accumulated_memory_stats()
 
@@ -314,12 +330,12 @@ class GraphProfiler(Interpreter):
         if n.op == "get_attr":
             self.attr_map[n] = return_val
 
-        if(self.profile_mode in [ProfileMode.swap, ProfileMode.memory]):
+        if self.profile_mode in [ProfileMode.swap, ProfileMode.memory]:
             mem_stats = torch.cuda.memory_stats()
             self.node_peak_mem.setdefault(n, [])
             self.node_peak_mem[n].append(mem_stats["active_bytes.all.peak"])
             self.node_active_mem.setdefault(n, [])
-            self.node_active_mem[n].append(mem_stats['active_bytes.all.current'])
+            self.node_active_mem[n].append(mem_stats["active_bytes.all.current"])
             if self.gtype == GraphType.forward and n in self.intermediate_nodes:
                 assert isinstance(return_val, torch.Tensor)
                 (
@@ -447,30 +463,29 @@ class GraphProfiler(Interpreter):
             self.peak_start = None
             self.peak_end = None
 
-
     def get_node_runtimes(self):
         event_list_avg: EventList = self.torch_profiler.key_averages()
-        event_dict: Dict[str, Tuple[float,float]] = {}
+        event_dict: Dict[str, Tuple[float, float]] = {}
         prefix = f"g{self.id}"
         for e in event_list_avg:
-            if(prefix in e.key):
+            if prefix in e.key:
                 event_dict[e.key] = (e.cuda_time, e.cpu_time)
         for n in self.module.graph.nodes:
-             if(n.op != 'placeholder'):
+            if n.op != "placeholder":
                 cuda_time, cpu_time = event_dict[f"{self.prefix_str}_{n.name}"]
-                self.node_cuda_time[n] = cuda_time/1000.0
-                self.node_cpu_time[n] = cpu_time/1000.0
-                self.runtimes_sec[n] = max(cpu_time, cuda_time)/1000.0
+                self.node_cuda_time[n] = cuda_time / 1000.0
+                self.node_cpu_time[n] = cpu_time / 1000.0
+                self.runtimes_sec[n] = max(cpu_time, cuda_time) / 1000.0
         if self.profile_mode == ProfileMode.swap:
-            if(self.gtype == GraphType.forward):
+            if self.gtype == GraphType.forward:
                 for int_n in self.intermediate_nodes:
                     cuda_time, cpu_time = event_dict[f"g{self.id}_{int_n.name}_swap"]
-                    self.node_cuda_swaptime[int_n] = cuda_time/1000.0
-                    self.node_cpu_swaptime[int_n] = cpu_time/1000.0
-                    self.swaptimes_sec[int_n] = max(cpu_time, cuda_time)/1000.0
+                    self.node_cuda_swaptime[int_n] = cuda_time / 1000.0
+                    self.node_cpu_swaptime[int_n] = cpu_time / 1000.0
+                    self.swaptimes_sec[int_n] = max(cpu_time, cuda_time) / 1000.0
 
     def summarize(self) -> Optional[Tuple[Any]]:
-    
+
         self.get_node_runtimes()
         self.total_runtime = 0
 
@@ -486,7 +501,10 @@ class GraphProfiler(Interpreter):
                     n_info.peak_mem = max(self.node_peak_mem.setdefault(node, [0]))
                     n_info.active_mem = max(self.node_active_mem.setdefault(node, [0]))
 
-                    if node in self.intermediate_nodes and self.profile_mode == ProfileMode.swap:
+                    if (
+                        node in self.intermediate_nodes
+                        and self.profile_mode == ProfileMode.swap
+                    ):
                         n_info: IntNodeInfo = self.node_info[node]
                         n_info.swap_time = self.swaptimes_sec[node]
 
@@ -509,10 +527,22 @@ class GraphProfiler(Interpreter):
             "CPU time(ms)",
         ]
         if self.profile_mode in [ProfileMode.swap, ProfileMode.memory]:
-            headers.extend(["Mem Active (B)", "Mem Peak Active(B)", "Tensor Size(B)",])
+            headers.extend(
+                [
+                    "Mem Active (B)",
+                    "Mem Peak Active(B)",
+                    "Tensor Size(B)",
+                ]
+            )
         if self.profile_mode == ProfileMode.swap:
             print("Peak Interval : ", str(self.peak_start), " - ", str(self.peak_end))
-            headers.extend(["Swap Time (ms)", "Idle_time(ms)", "Simulated Peak Active(B)",])
+            headers.extend(
+                [
+                    "Swap Time (ms)",
+                    "Idle_time(ms)",
+                    "Simulated Peak Active(B)",
+                ]
+            )
         for node in self.module.graph.nodes:
             if node.op == "placeholder":
                 continue
@@ -530,10 +560,12 @@ class GraphProfiler(Interpreter):
                 val_list.extend([n_info.active_mem, n_info.peak_mem])
             if node in self.intermediate_nodes:
                 n_info: IntNodeInfo = n_info
-                if(self.profile_mode == ProfileMode.memory):
-                    val_list.append(n_info.memory_size)                
+                if self.profile_mode == ProfileMode.memory:
+                    val_list.append(n_info.memory_size)
                 if self.profile_mode == ProfileMode.swap:
-                    val_list.extend([n_info.memory_size, n_info.swap_time, n_info.idle_time])   
+                    val_list.extend(
+                        [n_info.memory_size, n_info.swap_time, n_info.idle_time]
+                    )
             else:
                 if self.profile_mode == ProfileMode.memory:
                     val_list.append("")

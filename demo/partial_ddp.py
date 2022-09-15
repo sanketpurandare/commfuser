@@ -1,24 +1,24 @@
-from torch import fx
-from torch import nn
-from torch.distributed import ProcessGroup
-from functorch.compile import aot_function, aot_module, draw_graph
+import logging
+import os
+from dataclasses import dataclass
+from enum import Enum
+from enum import auto
+from typing import Callable
+from typing import List
+from typing import Set
+from typing import Union
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.utils._pytree as pytree
 import torchdynamo
-
-from dataclasses import dataclass
-from enum import Enum, auto
-from typing import  (
-    Callable,
-    List,
-    Set,
-    Union,
-)
-import logging
-import os
+from functorch.compile import aot_function
+from functorch.compile import aot_module
+from functorch.compile import draw_graph
+from torch import fx
+from torch import nn
+from torch.distributed import ProcessGroup
 
 
 class MyModel(nn.Module):
@@ -61,6 +61,7 @@ class DDP(nn.Module):
     """
     Tag each param as replicated
     """
+
     def __init__(self, module, pg=None):
         super().__init__()
         self.module = module
@@ -90,8 +91,10 @@ def allreduce(tensor, pg):
 
 
 def grad_as_bucket_view(states, grad, bucket_id, offset):
-    states.buckets[bucket_id][offset:(offset + grad.numel())] = grad.view(-1)
-    grad.data = states.buckets[bucket_id][offset:(offset + grad.numel())].view(grad.shape)
+    states.buckets[bucket_id][offset : (offset + grad.numel())] = grad.view(-1)
+    grad.data = states.buckets[bucket_id][offset : (offset + grad.numel())].view(
+        grad.shape
+    )
 
 
 def fused_allreduce(states, bucket_id, pg, blocked_by):
@@ -113,7 +116,8 @@ class Engine:
                                ``Engine`` will joinly optimize the entire
                                ``train_step``.
     """
-    def __init__(self, module: nn.Module, train_step: Callable, bucket_mb: int=25):
+
+    def __init__(self, module: nn.Module, train_step: Callable, bucket_mb: int = 25):
         # HACK: Meta device tracing is not ready. Have to create the module on
         # CPU for now.
         self.module = module
@@ -157,13 +161,15 @@ class Engine:
 
         out.sum().backward()
 
-
     def _fuse_allreduce(
         self,
         bucket_mb: int,
-        structured_bwd_gms: List[Union[fx.GraphModule, Set[fx.GraphModule]]]
+        structured_bwd_gms: List[Union[fx.GraphModule, Set[fx.GraphModule]]],
     ):
-        ordered_bwd_gms = [[x] if isinstance(x, fx.GraphModule) else list(x) for x in reversed(structured_bwd_gms)]
+        ordered_bwd_gms = [
+            [x] if isinstance(x, fx.GraphModule) else list(x)
+            for x in reversed(structured_bwd_gms)
+        ]
 
         # normalize allreduce, similar to DDP
         bucket_id, bucket_size, pg = 0, 0, None
@@ -194,14 +200,16 @@ class Engine:
                             param = self.primal_to_param[gm._id][primal]
                             grad_as_view_node = gm.graph.call_function(
                                 grad_as_bucket_view,
-                                args=(states_node, node.args[0], bucket_id, offset)
+                                args=(states_node, node.args[0], bucket_id, offset),
                             )
 
                         # 3. remember the blocking grad_as_view_node for the
                         # allreduce of this bucket.
                         if bucket_size >= self.bucket_mb * 1e6:
                             self.states.buckets.append(torch.zeros(bucket_size))
-                            self.states.bucket_blocked_by.append((gm, grad_as_view_node))
+                            self.states.bucket_blocked_by.append(
+                                (gm, grad_as_view_node)
+                            )
                             bucket_size = 0
                             bucket_id += 1
 
@@ -214,7 +222,9 @@ class Engine:
                 last_node = next(iter(gm.graph.nodes))
                 for i, bucket in enumerate(self.states.buckets[starting_bucket_id:]):
                     curr_bucket_id = starting_bucket_id + i
-                    blocked_by_gm, blocked_by_node = self.states.bucket_blocked_by[curr_bucket_id]
+                    blocked_by_gm, blocked_by_node = self.states.bucket_blocked_by[
+                        curr_bucket_id
+                    ]
                     if gm != blocked_by_gm:
                         with gm.graph.inserting_after(last_node):
                             states_node = gm.graph.get_attr("states")
@@ -222,7 +232,7 @@ class Engine:
                         with gm.graph.inserting_after(states_node):
                             last_node = gm.graph.call_function(
                                 fused_allreduce,
-                                args=(states_node, curr_bucket_id, None, last_node)
+                                args=(states_node, curr_bucket_id, None, last_node),
                             )
                     else:
                         with gm.graph.inserting_after(blocked_by_node):
@@ -231,7 +241,12 @@ class Engine:
                         with gm.graph.inserting_after(states_node):
                             last_node = gm.graph.call_function(
                                 fused_allreduce,
-                                args=(states_node, curr_bucket_id, None, blocked_by_node)
+                                args=(
+                                    states_node,
+                                    curr_bucket_id,
+                                    None,
+                                    blocked_by_node,
+                                ),
                             )
 
         # 5. process remaining grads. Create a bucket for the remaining grads
@@ -247,7 +262,9 @@ class Engine:
                     states_node = gm.graph.get_attr("states")
 
                 with gm.graph.inserting_after(states_node):
-                    gm.graph.call_function(fused_allreduce, args=(states_node, bucket_id, None, None))
+                    gm.graph.call_function(
+                        fused_allreduce, args=(states_node, bucket_id, None, None)
+                    )
 
         # 6. Erase individual allreduce node
         def erase_allreduce_node(gm):
@@ -268,7 +285,6 @@ class Engine:
                 gm.recompile()
                 gm.graph.print_tabular()
 
-
     def _aot_compile_fwd(self, gid: int, dynamo_fwd_gm: fx.GraphModule):
         def compile_fwd(gm: fx.GraphModule, inps) -> fx.GraphModule:
             nonlocal gid, dynamo_fwd_gm
@@ -276,7 +292,12 @@ class Engine:
             def to_param(model: nn.Module, primal_name: str) -> torch.nn.Parameter:
                 idx = int(primal_name.split("_")[-1]) - 1
                 # HACK: Dynamo primal order is the reverse of AOTAutograd???
-                params = [p for _, p in reversed(list(pytree.tree_flatten(model.named_parameters())[0][0]))]
+                params = [
+                    p
+                    for _, p in reversed(
+                        list(pytree.tree_flatten(model.named_parameters())[0][0])
+                    )
+                ]
                 return params[idx] if idx < len(params) else None
 
             # get tags on each param
@@ -284,18 +305,24 @@ class Engine:
                 if node.op == "placeholder" and node.target.startswith("primal"):
                     p = to_param(dynamo_fwd_gm, node.name)
                     if p is not None:
-                        assert node.target not in self.primal_to_param, (
-                            f"inserting {node.target} twice"
-                        )
+                        assert (
+                            node.target not in self.primal_to_param
+                        ), f"inserting {node.target} twice"
                         # HACK: use sub-graph gid to distinguish primals with the same name
                         self.primal_to_param[gid][node.target] = p
 
             logging.info(
-                f"\nCompiled SubGraph-{gid} forward, identified following Distributed Tensors\n" +
-                "\n".join([f"{pl} : {pm._dtags}" for pl, pm in self.primal_to_param[gid].items()])
+                f"\nCompiled SubGraph-{gid} forward, identified following Distributed Tensors\n"
+                + "\n".join(
+                    [
+                        f"{pl} : {pm._dtags}"
+                        for pl, pm in self.primal_to_param[gid].items()
+                    ]
+                )
             )
 
             return gm
+
         return compile_fwd
 
     def _aot_compile_bwd(self, gid: int, dynamo_fwd_gm: fx.GraphModule):
@@ -328,7 +355,9 @@ class Engine:
                         for dtag in self.primal_to_param[gid][primal]._dtags:
                             if dtag.dttype == DTensorType.REPLICATED:
                                 with gm.graph.inserting_after(grad_node):
-                                    gm.graph.call_function(allreduce, args=(grad_node, dtag.pg))
+                                    gm.graph.call_function(
+                                        allreduce, args=(grad_node, dtag.pg)
+                                    )
                     break
 
             gm.graph.lint()
@@ -341,6 +370,7 @@ class Engine:
             gm._id = gid
             dynamo_fwd_gm._aot_bwd_graph = gm
             return gm
+
         return compile_bwd
 
     def _compile(self):
@@ -374,6 +404,7 @@ class Engine:
         # HACK: compiler for Dyanmo. Record all graphs compiled and save them for
         # global fusion.
         graphs, graph_to_inputs, gid = [], {}, 0
+
         def compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]):
             nonlocal graphs, graph_to_inputs, gid
 
@@ -386,17 +417,26 @@ class Engine:
 
             for prior_gm in graphs:
                 prior_inputs = graph_to_inputs[prior_gm]
-                if all([same_activation(x, y) for x, y in zip(example_inputs, prior_inputs)]):
+                if all(
+                    [
+                        same_activation(x, y)
+                        for x, y in zip(example_inputs, prior_inputs)
+                    ]
+                ):
                     prior_gm._siblings.append(gm)
                     gm._siblings = prior_gm._siblings
-                    logging.info(f"Found siblings Sub-Graph-{gm._id} and Sub-Graph-{prior_gm._id}")
+                    logging.info(
+                        f"Found siblings Sub-Graph-{gm._id} and Sub-Graph-{prior_gm._id}"
+                    )
 
             if len(gm._siblings) <= 1:
                 graphs.append(gm)
                 graph_to_inputs[gm] = example_inputs
 
             # Calling AOTAutograd to insert individual allreduce
-            compiled_m = aot_module(gm, self._aot_compile_fwd(gid, gm), self._aot_compile_bwd(gid, gm))
+            compiled_m = aot_module(
+                gm, self._aot_compile_fwd(gid, gm), self._aot_compile_bwd(gid, gm)
+            )
             gid += 1
             return compiled_m
 
@@ -455,18 +495,13 @@ def run_worker(rank, world_size):
     for batch in [
         torch.zeros(2, n_features),
         torch.ones(2, n_features),
-        -torch.ones(2, n_features)
+        -torch.ones(2, n_features),
     ]:
         engine.run(batch)
 
 
-
-
-if __name__=="__main__":
+if __name__ == "__main__":
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29500"
     world_size = 2
-    mp.spawn(run_worker,
-        args=(world_size,),
-        nprocs=world_size,
-        join=True)
+    mp.spawn(run_worker, args=(world_size,), nprocs=world_size, join=True)
