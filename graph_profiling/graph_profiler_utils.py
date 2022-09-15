@@ -1,26 +1,31 @@
 import math
-from enum import Enum, auto
-from typing import List, Tuple
+from enum import Enum
+from enum import auto
+from typing import List
+from typing import Tuple
 
 import torch
-from torch.fx import GraphModule, Interpreter, Node
+from torch.fx import GraphModule
+from torch.fx import Interpreter
+from torch.fx import Node
 
 # some pytorch low-level memory management constant the minimal allocate memory
 # size (Byte)
 PYTORCH_MIN_ALLOCATE = 2**20
 # the minimal cache memory size (Byte)
 PYTORCH_MIN_CACHE = 2**20
-#default device for graph based profiling
+# default device for graph based profiling
 DEVICE = torch.device("cuda")
-#Used for determining if the peak memory usage exceeds the device memory
+# Used for determining if the peak memory usage exceeds the device memory
 MEM_LIMIT = torch.cuda.get_device_properties(DEVICE).total_memory
 
-#forward declaration of the GraphProfiler class
+# forward declaration of the GraphProfiler class
 class GraphProfiler(Interpreter):
     pass
 
-#Bidirectional Dictionary to store the mapping of the forward and backward pass
-#intermediate nodes
+
+# Bidirectional Dictionary to store the mapping of the forward and backward pass
+# intermediate nodes
 class BiDict(dict):
     def __init__(self, *args, **kwargs):
         super(BiDict, self).__init__(*args, **kwargs)
@@ -45,25 +50,26 @@ class GraphType(Enum):
     forward = auto()
     backward = auto()
 
+
 class ProfileMode(Enum):
     r"""
-        ProfileMode : The Graph Profiler provides three profiling
-        modes,``default``, ``swap`` and ``mem_saver_swap``.
-                default: Measure the per node run-time, marks the intermediate 
-                        nodes (activations saved from forward pass and needed in
-                        backward pass), registers their last use in the forward
-                        pass and first use in the backward pass, measures this
-                        idle time and, marks the irst use of the model parameter
-                        nodes in the forward pass.
-                memory: All of the above plus active memory usage,
-                        peak memory usage and intermediate (activation) memory.
-                swap:   All the of the above plus profiles in a low memory
-                        mode, pushing all of the activations to the CPU
-                        memory during the forward pass and fetches them
-                        back when they are needed in the backward pass.
-                        It measures the time to swap each of the intermediate 
-                        tensors (activations) to CPU memory, back and forth.
-                        Allows profiling graphs way larger than GPU memory.
+    ProfileMode : The Graph Profiler provides three profiling
+    modes,``default``, ``swap`` and ``mem_saver_swap``.
+            default: Measure the per node run-time, marks the intermediate
+                    nodes (activations saved from forward pass and needed in
+                    backward pass), registers their last use in the forward
+                    pass and first use in the backward pass, measures this
+                    idle time and, marks the irst use of the model parameter
+                    nodes in the forward pass.
+            memory: All of the above plus active memory usage,
+                    peak memory usage and intermediate (activation) memory.
+            swap:   All the of the above plus profiles in a low memory
+                    mode, pushing all of the activations to the CPU
+                    memory during the forward pass and fetches them
+                    back when they are needed in the backward pass.
+                    It measures the time to swap each of the intermediate
+                    tensors (activations) to CPU memory, back and forth.
+                    Allows profiling graphs way larger than GPU memory.
     """
     default = auto()
     memory = auto()
@@ -90,10 +96,10 @@ def same_storage(x: torch.Tensor, y: torch.Tensor) -> bool:
 
 def get_tensor_stat(tensor: torch.Tensor) -> Tuple[int, int, int]:
     r"""
-    Utility method that provides stats on the queried tensor. Args: 
+    Utility method that provides stats on the queried tensor. Args:
         tensor (torch.Tensor): Input tensor to get the stats for
     Returns:
-        Tuple(size, numel, memory_size): 
+        Tuple(size, numel, memory_size):
             size: the dimensions of ``tensor`` numel: number of elements in the
             ``tensor`` memory_size: the physical memeory occupied by the
             ``tensor`` in
@@ -124,14 +130,15 @@ def get_tensor_stat(tensor: torch.Tensor) -> Tuple[int, int, int]:
 
 # Node Information on All Tensors produced in a graph
 
+
 class NodeInfo:
     r"""
     The base class to store the profiling and static graph analysis information
     for all the nodes in the graph. 1) rank (int): stores the rank of the node
     in the order that is executed. 2) gtype (GraphType): denotes if the node
     belongs to the forward/backward
-                            graph 
-    3) run_time (float): the recorded run-time to the node in ms. 
+                            graph
+    3) run_time (float): the recorded run-time to the node in ms.
     4) cumulative_run_time (float): the cumulative run-time of the node from the
                                     first node in the graph.
     5) peak_mem (int): the peak memory usage of the node during execution in
@@ -156,6 +163,7 @@ class NodeInfo:
                                     the backward pass. Generally populated for
                                     the intermediate (activation) nodes.
     """
+
     def __init__(self):
         self.rank: int = 0
         self.gtype: GraphType = None
@@ -183,6 +191,7 @@ class NodeInfo:
 
 # Node Information for Intermediate Tensors
 
+
 class IntNodeInfo(NodeInfo):
     r"""
     Derieved class to store the profiling and static graph analysis information
@@ -191,12 +200,13 @@ class IntNodeInfo(NodeInfo):
                             swap_time) - (last_forward_access + swap_time)].
     2) swap_time (float): The time in ms required to swap tensor to and fro CPU
                             memory.
-    3) size (Tuple): The dimension of the intermediate tensor. 
+    3) size (Tuple): The dimension of the intermediate tensor.
     4) memory_size (int): the physical memeory occupied by the tensor in bytes
     5) numel (int): number of elements in the tensor.
     6) cpu_ref (torch.Tensor): The reference to the pinned memory CPU tensor.
     7) status (TensorStatus): Current status of the tensor (CPU/GPU/Deleted)
     """
+
     def __init__(self):
         super().__init__()
         # populated during profiling

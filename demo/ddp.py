@@ -1,34 +1,35 @@
-from functorch.compile import aot_function, aot_module, draw_graph
-from torch import nn
-from torch.distributed import ProcessGroup
+import logging
+import os
+from dataclasses import dataclass
+from enum import Enum
+from enum import auto
+from functools import partial
+from typing import Any
+from typing import Callable
+from typing import Optional
 
 import torch
 import torch.distributed as dist
 import torch.fx as fx
 import torch.multiprocessing as mp
 import torch.utils._pytree as pytree
-
-
-from dataclasses import dataclass
-from enum import Enum, auto
-from functools import partial
-from typing import (
-    Any,
-    Callable,
-    Optional,
-)
-import logging
-import os
-
+from functorch.compile import aot_function
+from functorch.compile import aot_module
+from functorch.compile import draw_graph
+from torch import nn
+from torch.distributed import ProcessGroup
 
 
 class MyModel(nn.Module):
     def __init__(self, n_features, n_layers):
         super().__init__()
-        self.seq = nn.Sequential(*[nn.Linear(n_features, n_features) for _ in range(n_layers)])
+        self.seq = nn.Sequential(
+            *[nn.Linear(n_features, n_features) for _ in range(n_layers)]
+        )
 
     def forward(self, x):
         return self.seq(x)
+
 
 # Type of the distributed tensor
 class DTensorType(Enum):
@@ -51,6 +52,7 @@ class DDP(nn.Module):
     """
     Tag each param as replicated
     """
+
     def __init__(self, module, pg=None):
         super().__init__()
         self.module = module
@@ -60,7 +62,6 @@ class DDP(nn.Module):
                 p._dtags = []
 
             p._dtags.append(DTensorTag(dttype=DTensorType.REPLICATED, pg=pg))
-
 
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
@@ -90,7 +91,7 @@ def fused_allreduce(tensors, pg):
     offset = 0
     for t in tensors:
         numel = t.numel()
-        buffer[offset:offset + numel] = t.view(-1)
+        buffer[offset : offset + numel] = t.view(-1)
         offset += numel
 
     dist.all_reduce(buffer, group=pg)
@@ -98,7 +99,7 @@ def fused_allreduce(tensors, pg):
     offset = 0
     for t in tensors:
         numel = t.numel()
-        t = buffer[offset:offset + numel].view(t.shape)
+        t = buffer[offset : offset + numel].view(t.shape)
         offset += numel
 
 
@@ -116,7 +117,8 @@ class Engine:
                                ``Engine`` will joinly optimize the entire
                                ``train_step``.
     """
-    def __init__(self, module: nn.Module, train_step: Callable, bucket_mb: int=25):
+
+    def __init__(self, module: nn.Module, train_step: Callable, bucket_mb: int = 25):
         # HACK: Meta device tracing is not ready. Have to create the module on
         # CPU for now.
         self.module = module
@@ -141,7 +143,9 @@ class Engine:
 
     def run(self, x: torch.Tensor):
         if self.compiled_m is None:
-            self.compiled_m = aot_module(self.module, self.compile_fwd, self.compile_bwd)
+            self.compiled_m = aot_module(
+                self.module, self.compile_fwd, self.compile_bwd
+            )
 
         # HACK: AOTAutograd cannot trace the train_step yet, so compile the
         # module for now.
@@ -152,7 +156,9 @@ class Engine:
         # for compile_bwd.
         def to_param(model: nn.Module, primal_name: str) -> torch.nn.Parameter:
             idx = int(primal_name.split("_")[-1]) - 1
-            params = [p for _, p in list(pytree.tree_flatten(model.named_parameters())[0][0])]
+            params = [
+                p for _, p in list(pytree.tree_flatten(model.named_parameters())[0][0])
+            ]
             return params[idx] if idx < len(params) else None
 
         logging.info("Compiling forward")
@@ -162,14 +168,16 @@ class Engine:
             if node.op == "placeholder" and node.target.startswith("primal"):
                 p = to_param(self.module, node.name)
                 if p is not None:
-                    assert node.target not in self.primal_to_param, (
-                        f"inserting {node.target} twice"
-                    )
+                    assert (
+                        node.target not in self.primal_to_param
+                    ), f"inserting {node.target} twice"
                     self.primal_to_param[node.target] = p
 
         logging.info(
-            "\nFinished compiling forward, identified following Distributed Tensors\n" +
-            "\n".join([f"{pl} : {pm._dtags}" for pl, pm in self.primal_to_param.items()])
+            "\nFinished compiling forward, identified following Distributed Tensors\n"
+            + "\n".join(
+                [f"{pl} : {pm._dtags}" for pl, pm in self.primal_to_param.items()]
+            )
         )
         return gm
 
@@ -183,13 +191,15 @@ class Engine:
             if node.op == "output":
                 # HACK: again, relying on the implicit guarantee that primals
                 # and gradient outputs follow the same order.
-                for i, grad_node in enumerate(node.args[0][:self.n_grads]):
+                for i, grad_node in enumerate(node.args[0][: self.n_grads]):
                     primal = f"primals_{i + 1}"
                     self.grad_to_primal[grad_node.name] = primal
                     for dtag in self.primal_to_param[primal]._dtags:
                         if dtag.dttype == DTensorType.REPLICATED:
                             with gm.graph.inserting_after(grad_node):
-                                gm.graph.call_function(allreduce, args=(grad_node, dtag.pg))
+                                gm.graph.call_function(
+                                    allreduce, args=(grad_node, dtag.pg)
+                                )
                                 pgs[grad_node] = dtag.pg
                 break
 
@@ -200,11 +210,13 @@ class Engine:
             # more readable if we convert it into an ATen operator
             if node.name.startswith("allreduce"):
                 comm_args.append(node.args[0])
-                comm_size += self.primal_to_param[self.grad_to_primal[node.args[0].name]].numel()
+                comm_size += self.primal_to_param[
+                    self.grad_to_primal[node.args[0].name]
+                ].numel()
                 comm_nodes.append(node)
-                assert pg is None or pg == pgs[node.args[0]], (
-                    "expecting the same ProcessGroup instance for now"
-                )
+                assert (
+                    pg is None or pg == pgs[node.args[0]]
+                ), "expecting the same ProcessGroup instance for now"
                 pg = pgs[node.args[0]]
                 last_node = node
 
@@ -274,11 +286,8 @@ def run_worker(rank, world_size):
     #   train_step(model, x)
 
 
-if __name__=="__main__":
+if __name__ == "__main__":
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29500"
     world_size = 2
-    mp.spawn(run_worker,
-        args=(world_size,),
-        nprocs=world_size,
-        join=True)
+    mp.spawn(run_worker, args=(world_size,), nprocs=world_size, join=True)
