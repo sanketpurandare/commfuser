@@ -8,8 +8,9 @@ from typing import Set
 from typing import Union
 
 import torch
-from scheduling.scheduling_policies import SchedulingPolicy
 from torch import fx
+
+from scheduling.scheduling_policies import SchedulingPolicy
 
 
 class BucketingStrategy(Enum):

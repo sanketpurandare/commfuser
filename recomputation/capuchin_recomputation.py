@@ -26,6 +26,15 @@ from functorch._src.partitioners import _extract_graph_with_inputs_outputs
 from functorch.compile import aot_function
 from functorch.compile import aot_module
 from functorch.compile import draw_graph
+from numpy import Inf
+from torch.fx import GraphModule
+from torch.fx import Interpreter
+from torch.fx import Node
+from torch.fx.node import map_arg
+from torch.profiler import ProfilerActivity
+from torch.profiler import profile
+from torch.profiler import record_function
+
 from graph_profiling.graph_profiler import GraphProfiler
 from graph_profiling.graph_profiler_utils import MEM_LIMIT
 from graph_profiling.graph_profiler_utils import BiDict
@@ -37,14 +46,6 @@ from graph_profiling.graph_profiler_utils import NodeInfo
 from graph_profiling.graph_profiler_utils import TensorStatus
 from graph_profiling.graph_profiler_utils import get_model_graphs
 from graph_profiling.graph_profiler_utils import get_tensor_stat
-from numpy import Inf
-from torch.fx import GraphModule
-from torch.fx import Interpreter
-from torch.fx import Node
-from torch.fx.node import map_arg
-from torch.profiler import ProfilerActivity
-from torch.profiler import profile
-from torch.profiler import record_function
 
 
 class CapuchinDistExecutor(Interpreter):
