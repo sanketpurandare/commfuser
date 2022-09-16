@@ -26,7 +26,7 @@ def static_bucketing(buckets:List[List[BucketElement]], structured_bwd_gms: List
     r_bucket_list = get_static_buckets (buckets, r_bucket_size)
     
 
-    # Now get the end to end iteration latency for these bucket configurations
+    # Now get the end to end iteration latency for these bucket configurations 
     l_latency = get_latency_from_simulator(structured_bwd_gms, l_bucket_list)
     
     r_latency = get_latency_from_simulator(structured_bwd_gms, r_bucket_list)
