@@ -3,7 +3,7 @@ import os
 from dataclasses import dataclass
 from enum import Enum
 from enum import auto
-from typing import Callable
+from typing import Any, Callable, Dict
 from typing import List
 from typing import Set
 from typing import Union
@@ -18,26 +18,11 @@ from functorch.compile import aot_module
 from functorch.compile import draw_graph
 from torch import fx
 from torch import nn
+from torch import optim
 from torch.distributed import ProcessGroup
+from commfuser.graph_profiling.graph_profiler_utils import GraphProfiler, GraphType
+from graph_profiling.graph_profiler_front_end import BACKWARD, FORWARD, ProfileEngine
 
-
-class MyModel(nn.Module):
-    def __init__(self, n_features):
-        super().__init__()
-        self.n_features = n_features
-        self.l1 = nn.Linear(n_features, n_features)
-        self.l2 = nn.Linear(n_features, n_features)
-        self.l3 = nn.Linear(n_features, n_features)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.l1(x)
-        if x.sum() > 0:
-            return self.l2(y)
-        else:
-            return self.l3(y)
-
-    def dummy_inputs(self) -> List[torch.Tensor]:
-        return [torch.ones(2, self.n_features), -torch.ones(2, self.n_features)]
 
 
 # Type of the distributed tensor
@@ -46,10 +31,10 @@ class DTensorType(Enum):
     SHARDED = auto()
     PARTIAL = auto()
 
-
 # A tag attached to local parameter to indicating how users plan to convert it
 # to a distributed tensor. Note that, one local param can have multiple
 # DTensorTag, and the order of these tags dictates the communication order.
+
 @dataclass
 class DTensorTag:
     dttype: DTensorType = DTensorType.REPLICATED
@@ -62,21 +47,18 @@ class DDP(nn.Module):
     Tag each param as replicated
     """
 
-    def __init__(self, module, pg=None):
+    def __init__(self, model:nn.Module, forward_loss:Callable,  pg=None):
         super().__init__()
-        self.module = module
+        self.model:nn.Module = model
+        self.forward_loss: Callable = forward_loss
+ 
 
-        for p in module.parameters():
+        for p in model.parameters():
             if not hasattr(p, "_dtags"):
                 p._dtags = []
 
             p._dtags.append(DTensorTag(dttype=DTensorType.REPLICATED, pg=pg))
 
-        if hasattr(module, "dummy_inputs"):
-            self.dummy_inputs = module.dummy_inputs
-
-    def forward(self, *args, **kwargs):
-        return self.module(*args, **kwargs)
 
 
 # HACK: dist.allreduce is not compatible with fx/AOTAutograd yet. It will be
@@ -119,20 +101,24 @@ class Engine:
                                ``train_step``.
     """
 
-    def __init__(self, module: nn.Module, train_step: Callable, bucket_mb: int = 25):
+    def __init__(self, model: nn.Module, forward_loss:Callable, optimizer:optim.Optimizer, example_inputs: Any, profile_mode:str):
         # HACK: Meta device tracing is not ready. Have to create the module on
         # CPU for now.
-        self.module = module
+        self.model = model
+        self.forward_loss: Callable = forward_loss
         # HACK: train_step is ignored at this time, as AOTAutograd cannot trace
         # through the full fwd + bwd + opt.step yet. Based on the discussion
         # with compiler this, this is addressable.
-        self.train_step = train_step
-        self.bucket_mb = bucket_mb
+
         # HACK: ideally, it will be better if fx/AOTAutograd can provide a way
         # to access original param, instead of us keeping the following maps.
-        self.primal_to_param = {}
-        self.grad_to_primal = {}
-
+        self.primal_to_param:Dict[int, Dict[str, nn.Parameter]] = {}
+        self.grad_to_primal:Dict[int, Dict[str, str]] = {}
+        self.optimizer: optim.Optimizer = optimizer
+        self.example_inputs: Any = example_inputs
+        self.profile_mode:str = profile_mode
+        self.profile_engine: ProfileEngine = ProfileEngine(self.model, self.forward_loss, self.optimizer, self.example_inputs, self.profile_mode)
+        self.profilers:Dict[int, Dict[GraphType, GraphProfiler]] = None
         self.optimize_ctx = None
 
         # HACK: Today, to pass non-placeholder states to fx.Nodes, we have to
@@ -146,6 +132,30 @@ class Engine:
 
         self.states = StatesModule()
 
+    def profile(self):
+        self.profile_engine.run(warm_up_iters=2, profile_iters=3)
+        self.profilers = self.profile_engine.profilers
+        self.process_node_info()
+
+    def process_node_info(self):
+        # Process the run_times of individual sub-graphs.
+        # Process the backward graphs in reverse order and 
+        # then process the forward graphs in the given order
+        self.prev_runtimes: Dict[int, Dict[GraphType, float]] = {}
+        num_graphs = len(self.profilers.keys())
+        cumulative_run_time: float = 0
+        for gid in reversed(range(num_graphs)):
+            bwd_profiler: GraphProfiler = self.profilers[gid][BACKWARD]
+            self.prev_runtimes[gid] = {}
+            self.prev_runtimes[gid][BACKWARD] = cumulative_run_time
+            cumulative_run_time += bwd_profiler.total_runtime
+
+        for gid in range(num_graphs):
+            fwd_profiler: GraphProfiler = self.profilers[gid][FORWARD]
+            self.prev_runtimes[gid][FORWARD] = cumulative_run_time
+            cumulative_run_time += fwd_profiler.total_runtime               
+        
+
     def run(self, x: torch.Tensor):
         if self.optimize_ctx is None:
             # _compile() does the following
@@ -157,6 +167,7 @@ class Engine:
             #    means parallel branches.
             # 4. Process all these subgraphs together to fuse AllReduce across
             #    subgraphs.
+            self.profile()
             self.optimize_ctx = self._compile()
 
         # Dynamo's context caches compiled graph. Use it for real execution.
@@ -164,6 +175,8 @@ class Engine:
             out = self.module(x)
 
         out.sum().backward()
+    
+
 
     def _fuse_allreduce(
         self,
@@ -289,6 +302,16 @@ class Engine:
                 gm.graph.lint()
                 gm.recompile()
                 gm.graph.print_tabular()
+
+    def _allreduce_bucketing_scheduling(self, structured_bwd_gms: List[Union[fx.GraphModule, Set[fx.GraphModule]]]):
+        #1. Create a bucket with an individual gradient being a bucket
+        #2. Create a list of bucket elements for each backward graph module
+        #3. Create a dict for graph_id and bucket list
+        #4. Bucketing strategy produces a bucket configuration
+        #5. Pass this bucket configuration to the scheduling policy
+        #6. Predict a latency based on the bucket configuration and scheduling
+        #   order using a simulator
+        #7. Repeat 4-6 if necessary
 
     def _aot_compile_fwd(self, gid: int, dynamo_fwd_gm: fx.GraphModule):
         def compile_fwd(gm: fx.GraphModule, inps) -> fx.GraphModule:
@@ -439,6 +462,8 @@ class Engine:
             if len(gm._siblings) <= 1:
                 graphs.append(gm)
                 graph_to_inputs[gm] = example_inputs
+            else:
+                raise AssertionError("Sibling Graphs are not expected.")
 
             # Calling AOTAutograd to insert individual allreduce
             compiled_m = aot_module(
@@ -464,6 +489,7 @@ class Engine:
                 structured_graphs.append(gm._aot_bwd_graph)
 
         # HACK: fuse allreduces across sub-graphs
+        self._allreduce_bucketing_scheduling(structured_graphs)
         self._fuse_allreduce(self.bucket_mb, structured_graphs)
 
         logging.info(f"Structured Sub-Graphs: {structured_graphs}")

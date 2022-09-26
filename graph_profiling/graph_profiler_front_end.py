@@ -112,7 +112,6 @@ class ProfileEngine:
         my_schedule = schedule(
             skip_first=1, wait=1, warmup=warm_up_iters, active=profile_iters
         )
-        exit()
         logging.info("Profling...")
         init_prof = False
         with profile(
@@ -263,7 +262,6 @@ class ProfileEngine:
             )
             gid += 1
             return compiled_m
-
         optimize_ctx = torchdynamo.optimize(dynamo_compiler)
 
         self.forward_loss(optimize_ctx(self.model), self.example_inputs).backward()
