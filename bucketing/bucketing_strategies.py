@@ -1,125 +1,244 @@
 import logging
 import os
+import sys
 from decimal import MAX_EMAX
 from enum import Enum
 from enum import auto
+from typing import Dict
 from typing import List
 from typing import Set
 from typing import Union
 
 import torch
+from commfuser.graph_profiling.graph_profiler_utils import GraphProfiler
+from commfuser.graph_profiling.graph_profiler_utils import GraphType
+from commfuser.simulation.simulators import get_latency_from_simulator
 from scheduling.scheduling_policies import SchedulingPolicy
 from torch import fx
 
 
 class BucketingStrategy(Enum):
-    STATIC = auto()
-    DYNAMIC = auto()
+    FIXED = auto()
+    VARIABLE = auto()
 
 
 class BucketElement:
-    def __init__(self, grad: fx.Node, gm_id: int, numel: int) -> None:
+    def __init__(self, grad: fx.Node, param:fx.Node, gm_id: int, numel: int) -> None:
         self.grad: fx.Node = grad
+        self.param: fx.Node = param
         self.gm_id = gm_id
         self.numel = numel
 
 
-def get_latency_from_simulator(
-    structured_bwd_gms: List[Union[fx.GraphModule, Set[fx.GraphModule]]],
-    buckets: List[List[BucketElement]],
-):
-    pass
+class Bucket:
+    def __init__(
+        self, bucket_list: List[BucketElement], last_grad: fx.Node, first_param: fx.node
+    ):
+        self.bucket_list: List[BucketElement] = bucket_list
+        self.last_grad: fx.Node = last_grad
+        self.first_param: fx.Node = first_param
+        self.burst_time: float = 0
 
 
-def static_bucketing(
-    buckets: List[List[BucketElement]],
-    structured_bwd_gms: List[Union[fx.GraphModule, Set[fx.GraphModule]]],
+
+def get_scheduled_bucket_order(
+    bucket_list: List[List[BucketElement]],
+    profilers: Dict[int, Dict[GraphType, GraphProfiler]],
+    prev_runtimes: Dict[int, Dict[GraphType, float]],
+    scheduling_policy: SchedulingPolicy,
+) -> List[Bucket]:
+    unscheduled_bucktes:List[Bucket]
+    for b_list in bucket_list:
+        gm_ids:Set[int] = set([be.gm_id for be in b_list])
+        assert(len(gm_ids)==1)
+        b_gm_id:int = gm_ids.pop()
+
+
+
+
+
+
+def fixed_bucketing(
+    bucket_dict: Dict[int, List[List[BucketElement]]],
+    profilers: Dict[int, Dict[GraphType, GraphProfiler]],
+    prev_runtimes: Dict[int, Dict[GraphType, float]],
     l_bucket_size: int,
     r_bucket_size: int,
+    scheduling_policy: SchedulingPolicy,
 ):
+    def get_fixed_buckets(buckets: List[List[BucketElement]], bucket_size: int):
+        def get_numel(bucket: List[BucketElement]):
+            total_numel = 0
+            for b in bucket:
+                total_numel += b.numel
+            return total_numel
 
-    l_bucket_list = get_static_buckets(buckets, l_bucket_size)
-    r_bucket_list = get_static_buckets(buckets, r_bucket_size)
+        bucket_list = []
+        bsize = 0
+        current_head = None
+        for b in buckets:
+            bsize += get_numel(b)
+            if current_head is None:
+                current_head = b
+            else:
+                current_head.extend(b)
 
-    # Now get the end to end iteration latency for these bucket configurations 
-    l_latency = get_latency_from_simulator(structured_bwd_gms, l_bucket_list)
+            if bsize >= bucket_size:
+                bsize = 0
+                bucket_list.append(current_head)
+                current_head = None
 
-    r_latency = get_latency_from_simulator(structured_bwd_gms, r_bucket_list)
+        if current_head is not None:
+            bucket_list.append(current_head)
+        return bucket_list
+
+    meta_l_bucket_list: List[List[BucketElement]] = []
+    meta_r_bucket_list: List[List[BucketElement]] = []
+    for gid in reversed(range(len(bucket_dict))):
+        bucket_list: List[List[BucketElement]] = bucket_dict[gid]
+        l_bucket_list = get_fixed_buckets(bucket_list, l_bucket_size)
+        r_bucket_list = get_fixed_buckets(bucket_list, r_bucket_size)
+        meta_l_bucket_list.extend(l_bucket_list)
+        meta_r_bucket_list.extend(r_bucket_list)
+
+    ordered_l_buckets: List[Bucket] = get_scheduled_bucket_order(
+        meta_l_bucket_list, profilers, prev_runtimes, scheduling_policy
+    )
+    ordered_r_buckets: List[Bucket] = get_scheduled_bucket_order(
+        meta_r_bucket_list, profilers, prev_runtimes, scheduling_policy
+    )
+
+    # Now get the end to end iteration latency for these bucket configurations
+    l_latency = get_latency_from_simulator(ordered_l_buckets, profilers, prev_runtimes)
+    r_latency = get_latency_from_simulator(ordered_r_buckets, profilers, prev_runtimes)
 
     def binary_search_bucket_size(
-        buckets: List[List[BucketElement]],
+        bucket_dict: Dict[int, List[List[BucketElement]]],
+        profilers: Dict[int, Dict[GraphType, GraphProfiler]],
+        prev_runtimes: Dict[int, Dict[GraphType, float]],
         l_bucket_size: int,
         l_latency: float,
+        ordered_l_buckets: List[Bucket],
         r_bucket_size: int,
         r_latency: float,
+        ordered_r_buckets: List[Bucket],
+        scheduling_policy: SchedulingPolicy,
     ):
-        nonlocal structured_bwd_gms
 
-        if abs(l_bucket_size - r_bucket_size) < 20:
-            return l_bucket_size
+        if abs(l_bucket_size - r_bucket_size) < l_bucket_size:
+            if l_latency < r_latency:
+                return ordered_l_buckets
+            else:
+                return ordered_r_buckets
+
         m_bucket_size = (l_bucket_size + r_bucket_size) / 2
-        m_bucket_list = get_static_buckets(buckets, m_bucket_size)
-        m_latency = get_latency_from_simulator(structured_bwd_gms, m_bucket_list)
+        meta_m_bucket_list: List[List[BucketElement]] = []
+        for gid in reversed(range(len(bucket_dict))):
+            bucket_list: List[List[BucketElement]] = bucket_dict[gid]
+            m_bucket_list = get_fixed_buckets(bucket_list, m_bucket_size)
+            meta_m_bucket_list.extend(m_bucket_list)
+
+        ordered_m_buckets: List[Bucket] = get_scheduled_bucket_order(
+            meta_m_bucket_list, profilers, prev_runtimes, scheduling_policy
+        )
+        m_latency = get_latency_from_simulator(
+            ordered_m_buckets, profilers, prev_runtimes
+        )
 
         if l_latency < m_latency:
             # search for a bucket size between l and m
             return binary_search_bucket_size(
-                buckets, l_bucket_size, l_latency, m_bucket_size, m_latency
+                bucket_dict,
+                profilers,
+                prev_runtimes,
+                l_bucket_size,
+                l_latency,
+                ordered_l_buckets,
+                m_bucket_size,
+                m_latency,
+                ordered_m_buckets,
+                scheduling_policy,
             )
         else:
             # search for a bucket size between m and r
             return binary_search_bucket_size(
-                buckets, m_bucket_size, m_latency, r_bucket_size, r_latency
+                bucket_dict,
+                profilers,
+                prev_runtimes,
+                m_bucket_size,
+                m_latency,
+                ordered_m_buckets,
+                r_bucket_size,
+                r_latency,
+                ordered_r_buckets,
+                scheduling_policy,
             )
 
-
-def get_static_buckets(buckets: List[List[BucketElement]], bucket_size: int):
-    def get_numel(bucket: List[BucketElement]):
-        total_numel = 0
-        for b in bucket:
-            total_numel += b.numel
-        return total_numel
-
-    bucket_list = []
-    bsize = 0
-    current_head = None
-    for b in buckets:
-        bsize += get_numel(b)
-        if current_head is None:
-            current_head = b
-        else:
-            current_head.extend(b)
-
-        if bsize >= bucket_size:
-            bsize = 0
-            bucket_list.append(current_head)
-            current_head = None
-
-    if current_head is not None:
-        bucket_list.append(current_head)
-    return bucket_list
+    return binary_search_bucket_size(
+        bucket_dict,
+        profilers,
+        prev_runtimes,
+        l_bucket_size,
+        l_latency,
+        ordered_l_buckets,
+        r_bucket_size,
+        r_latency,
+        ordered_r_buckets,
+        scheduling_policy,
+    )
 
 
-def dynamic_bucketing(
-    buckets: List[List[BucketElement]],
-    structured_bwd_gms: List[Union[fx.GraphModule, Set[fx.GraphModule]]],
+def variable_bucketing(
+    bucket_dict: Dict[int, List[List[BucketElement]]],
+    profilers: Dict[int, Dict[GraphType, GraphProfiler]],
+    prev_runtimes: Dict[int, Dict[GraphType, float]],
+    scheduling_policy: SchedulingPolicy,
 ):
-    latency = get_latency_from_simulator(buckets, structured_bwd_gms)
+    meta_bucket_list: List[List[BucketElement]] = []
+    for gid in reversed(range(len(bucket_dict))):
+        gm_bucket_list: List[List[BucketElement]] = bucket_dict[gid]
+        meta_bucket_list.extend(gm_bucket_list)
+    ordered_buckets: List[Bucket] = get_scheduled_bucket_order(
+        meta_bucket_list, profilers, prev_runtimes, scheduling_policy
+    )
+    latency = get_latency_from_simulator(ordered_buckets, profilers, prev_runtimes)
+
+    def check_valid_pair(bucket_list: List[List[BucketElement]], i, j) -> bool:
+        last_elem_bucket_i: BucketElement = bucket_list[i][-1]
+        first_elem_bucket_j: BucketElement = bucket_list[j][0]
+        return last_elem_bucket_i.gm_id == first_elem_bucket_j.gm_id
+
+    ret_ordered_buckets: List[Bucket] = ordered_buckets
     while True:
-        min_pair_latency = 1000000.0
-        min_pair_index = -1
-        for i in range(len(buckets) - 1):
-            pair = [buckets[i] + buckets[i + 1]]
-            bucket_list = buckets[:i] + pair + buckets[i + 2 :]
-            i_latency = get_latency_from_simulator(bucket_list, structured_bwd_gms)
-            if i_latency < min_pair_latency:
-                min_pair_latency = i_latency
-                min_pair_index = i
+        min_pair_latency: float = sys.float_info.max
+        min_pair_index: int = -1
+        min_ordered_buckets: List[Bucket] = None
+        for i in range(len(meta_bucket_list) - 1):
+            if check_valid_pair(meta_bucket_list, i, i + 1):
+                pair = [meta_bucket_list[i] + meta_bucket_list[i + 1]]
+                i_bucket_list = meta_bucket_list[:i] + pair + meta_bucket_list[i + 2 :]
+                i_ordered_buckets: List[Bucket] = get_scheduled_bucket_order(
+                    i_bucket_list, profilers, prev_runtimes, scheduling_policy
+                )
+                i_latency = get_latency_from_simulator(
+                    i_ordered_buckets, profilers, prev_runtimes
+                )
+                if i_latency < min_pair_latency:
+                    min_pair_latency = i_latency
+                    min_pair_index = i
+                    min_ordered_buckets = i_ordered_buckets
+            else:
+                continue
         if min_pair_latency > latency:
             break
         else:
-            buckets[min_pair_index].extend(buckets[min_pair_index + 1])
-            buckets.remove(buckets[min_pair_index + 1])
+            meta_bucket_list[min_pair_index].extend(
+                meta_bucket_list[min_pair_index + 1]
+            )
+            meta_bucket_list.remove(meta_bucket_list[min_pair_index + 1])
+            ret_ordered_buckets = min_ordered_buckets
+
+    return ret_ordered_buckets
 
 
 if __name__ == "__main__":

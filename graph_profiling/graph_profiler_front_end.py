@@ -262,6 +262,7 @@ class ProfileEngine:
             )
             gid += 1
             return compiled_m
+
         optimize_ctx = torchdynamo.optimize(dynamo_compiler)
 
         self.forward_loss(optimize_ctx(self.model), self.example_inputs).backward()
