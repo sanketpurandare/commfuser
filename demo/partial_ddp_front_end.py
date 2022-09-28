@@ -36,8 +36,10 @@ from torch.distributed import ProcessGroup
 MIN_BUCKET_SIZE = 25 * (2**18)  # 25MB/4
 MAX_BUCKET_SIZE = 2**28  # 1024MB/4 = 1GB/4
 
-def get_all_reduce_burst_time()->float:
+
+def get_all_reduce_burst_time() -> float:
     pass
+
 
 # Type of the distributed tensor
 class DTensorType(Enum):
@@ -225,9 +227,11 @@ class Engine:
                 gm_bucket_list: List[List[BucketElement]] = []
                 for node in gm.graph.nodes:
                     if node.name.startswith("allreduce"):
-                        grad_node:fx.Node = node.args[0]
-                        primal_node:fx.Node = self.grad_to_primal[gm._id][grad_node]
-                        grad_numel:int = self.primal_to_param[gm._id][primal_node].numel()
+                        grad_node: fx.Node = node.args[0]
+                        primal_node: fx.Node = self.grad_to_primal[gm._id][grad_node]
+                        grad_numel: int = self.primal_to_param[gm._id][
+                            primal_node
+                        ].numel()
                         bucket_element: BucketElement = BucketElement(
                             grad_node, primal_node, gm._id, grad_numel
                         )
@@ -318,8 +322,8 @@ class Engine:
                     # HACK: again, relying on the implicit guarantee that
                     # primals and gradient outputs follow the same order.
                     for i, grad_node in enumerate(node.args[0][:n_grads]):
-                        primal:str = f"primals_{i+1}"
-                        primal_node:fx.Node = self.primal_name_to_node[gid][primal]
+                        primal: str = f"primals_{i+1}"
+                        primal_node: fx.Node = self.primal_name_to_node[gid][primal]
                         self.grad_to_primal[gid][grad_node] = primal_node
                         for dtag in self.primal_to_param[gid][primal_node]._dtags:
                             if dtag.dttype == DTensorType.REPLICATED:
