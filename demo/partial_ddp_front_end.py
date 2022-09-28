@@ -36,6 +36,9 @@ from torch.distributed import ProcessGroup
 MIN_BUCKET_SIZE = 25 * (2**18)  # 25MB/4
 MAX_BUCKET_SIZE = 2**28  # 1024MB/4 = 1GB/4
 
+def get_all_reduce_burst_time()->float:
+    pass
+
 # Type of the distributed tensor
 class DTensorType(Enum):
     REPLICATED = auto()
@@ -222,10 +225,11 @@ class Engine:
                 gm_bucket_list: List[List[BucketElement]] = []
                 for node in gm.graph.nodes:
                     if node.name.startswith("allreduce"):
-                        primal_node:fx.Node = self.grad_to_primal[gm._id][node.args[0]]
-                        grad_numel = self.primal_to_param[gm._id][primal_node].numel()
+                        grad_node:fx.Node = node.args[0]
+                        primal_node:fx.Node = self.grad_to_primal[gm._id][grad_node]
+                        grad_numel:int = self.primal_to_param[gm._id][primal_node].numel()
                         bucket_element: BucketElement = BucketElement(
-                            node.args[0], primal_node, gm._id, grad_numel
+                            grad_node, primal_node, gm._id, grad_numel
                         )
                         gm_bucket_list.append([bucket_element])
                 bucket_dict[gm._id] = gm_bucket_list
@@ -314,9 +318,10 @@ class Engine:
                     # HACK: again, relying on the implicit guarantee that
                     # primals and gradient outputs follow the same order.
                     for i, grad_node in enumerate(node.args[0][:n_grads]):
-                        primal = f"primals_{i+1}"
-                        self.grad_to_primal[gid][grad_node.name] = primal
-                        for dtag in self.primal_to_param[gid][primal]._dtags:
+                        primal:str = f"primals_{i+1}"
+                        primal_node:fx.Node = self.primal_name_to_node[gid][primal]
+                        self.grad_to_primal[gid][grad_node] = primal_node
+                        for dtag in self.primal_to_param[gid][primal_node]._dtags:
                             if dtag.dttype == DTensorType.REPLICATED:
                                 with gm.graph.inserting_after(grad_node):
                                     gm.graph.call_function(

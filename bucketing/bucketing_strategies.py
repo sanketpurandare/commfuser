@@ -10,10 +10,13 @@ from typing import Set
 from typing import Union
 
 import torch
-from commfuser.graph_profiling.graph_profiler_utils import GraphProfiler
+from commfuser.demo.partial_ddp_front_end import get_all_reduce_burst_time
+from commfuser.graph_profiling.graph_profiler import GraphProfiler
+from commfuser.graph_profiling.graph_profiler_front_end import BACKWARD, FORWARD
+from commfuser.graph_profiling.graph_profiler_utils import NodeInfo
 from commfuser.graph_profiling.graph_profiler_utils import GraphType
 from commfuser.simulation.simulators import get_latency_from_simulator
-from scheduling.scheduling_policies import SchedulingPolicy
+from scheduling.scheduling_policies import Process, SchedulingPolicy, branch_and_bound_algorithm, fcfs_scheduling, greedy_scheduling_IPRTT, greedy_scheduling_NDPRTT
 from torch import fx
 
 
@@ -32,12 +35,13 @@ class BucketElement:
 
 class Bucket:
     def __init__(
-        self, bucket_list: List[BucketElement], last_grad: fx.Node, first_param: fx.node
+        self, bid:int, bucket_list: List[BucketElement], last_grad: fx.Node, first_param: fx.node, burst_time:float
     ):
+        self.id:int = bid
         self.bucket_list: List[BucketElement] = bucket_list
         self.last_grad: fx.Node = last_grad
         self.first_param: fx.Node = first_param
-        self.burst_time: float = 0
+        self.burst_time: float = burst_time
 
 
 
@@ -47,14 +51,55 @@ def get_scheduled_bucket_order(
     prev_runtimes: Dict[int, Dict[GraphType, float]],
     scheduling_policy: SchedulingPolicy,
 ) -> List[Bucket]:
-    unscheduled_bucktes:List[Bucket]
-    for b_list in bucket_list:
+
+    def get_last_grad_generated(bucket:List[BucketElement], graph_profiler:GraphProfiler)->fx.Node:
+        bucket_grads:List[fx.Node] = [be.grad for be in bucket]
+        node_info:Dict[fx.Node,NodeInfo] = graph_profiler.node_info
+        last_grad:fx.Node = max(bucket_grads, key= lambda grad_node: node_info[grad_node].rank)
+        return last_grad
+
+    def get_first_param_usage(bucket:List[BucketElement], graph_profiler:GraphProfiler)->fx.Node:
+        node_info:Dict[fx.Node, NodeInfo] = graph_profiler.node_info
+        bucket_params:List[fx.Node] = [be.param for be in bucket]
+        first_param:fx.Node = min(bucket_params, key = lambda param_node: node_info[node_info[param_node].first_forward_access].rank)
+        return first_param
+
+    def process_creator(bucket:Bucket, profilers:Dict[GraphType, GraphProfiler], prev_runtimes:Dict[GraphType, float])->Process:
+        pid:int = bucket.id
+        arrival_time:float = prev_runtimes[BACKWARD] + profilers[BACKWARD].node_info[bucket.last_grad].cumulative_run_time
+        first_forward_access:fx.Node = profilers[FORWARD].node_info[bucket.first_param].first_forward_access
+        deadline:float = prev_runtimes[FORWARD] + profilers[FORWARD].node_info[first_forward_access].cumulative_run_time - profilers[FORWARD].node_info[first_forward_access].run_time
+        burst_time:float = bucket.burst_time 
+        return Process(pid, arrival_time, deadline, burst_time)
+
+
+    unordered_buckets:List[Bucket] = []
+    unscheduled_processes:List[Process] = []
+    for bid, b_list in enumerate(bucket_list):
         gm_ids:Set[int] = set([be.gm_id for be in b_list])
         assert(len(gm_ids)==1)
         b_gm_id:int = gm_ids.pop()
+        last_grad:fx.Node = get_last_grad_generated(b_list, profilers[b_gm_id][BACKWARD])
+        first_param:fx.Node = get_first_param_usage(b_list, profilers[b_gm_id][FORWARD])
+        total_bucket_numel:int = sum([be.numel for be in b_list])
+        burst_time:float = get_all_reduce_burst_time(total_bucket_numel)
+        bucket:Bucket = Bucket(bid, b_list, last_grad, first_param, burst_time)
+        process:Process = process_creator(bucket, profilers[b_gm_id], prev_runtimes[b_gm_id])
+        unscheduled_processes.append(process)
+        unordered_buckets.append(bucket)
+    scheduled_processes:List[Process] = None
+    if(scheduling_policy == SchedulingPolicy.FCFS):
+        scheduled_processes = fcfs_scheduling(unscheduled_processes)
+    elif(scheduling_policy == SchedulingPolicy.GREEDY_IPRTT):
+        scheduled_processes = greedy_scheduling_IPRTT(unscheduled_processes)
+    elif(scheduling_policy == SchedulingPolicy.GREEDY_NDPRTT):
+        scheduled_processes = greedy_scheduling_NDPRTT(unscheduled_processes)
+    elif(scheduling_policy == SchedulingPolicy.BRANCH_AND_BOUND):
+        scheduled_processes = branch_and_bound_algorithm(unscheduled_processes)
 
+    ordered_buckets:List[Bucket] = [unordered_buckets[s_process.p_id] for s_process in scheduled_processes]
 
-
+    return ordered_buckets
 
 
 
@@ -239,15 +284,3 @@ def variable_bucketing(
             ret_ordered_buckets = min_ordered_buckets
 
     return ret_ordered_buckets
-
-
-if __name__ == "__main__":
-    bucket_list = []
-    for _ in range(50):
-        bucket = BucketElement(None, 0, 30)
-        bucket_list.append([bucket])
-
-    n_bucket_list = get_static_buckets(bucket_list, 70)
-    for b_list in n_bucket_list:
-
-        print(b_list)
