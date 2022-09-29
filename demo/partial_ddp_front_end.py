@@ -15,11 +15,13 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.utils._pytree as pytree
 import torchdynamo
+from commfuser.bucketing.bucketing_strategies import Bucket
 from commfuser.bucketing.bucketing_strategies import BucketElement
 from commfuser.bucketing.bucketing_strategies import BucketingStrategy
+from commfuser.bucketing.bucketing_strategies import constant_bucketing
 from commfuser.bucketing.bucketing_strategies import fixed_bucketing
 from commfuser.bucketing.bucketing_strategies import variable_bucketing
-from commfuser.graph_profiling.graph_profiler_utils import GraphProfiler
+from commfuser.graph_profiling.graph_profiler import GraphProfiler
 from commfuser.graph_profiling.graph_profiler_utils import GraphType
 from commfuser.scheduling.scheduling_policies import SchedulingPolicy
 from functorch.compile import aot_function
@@ -171,18 +173,17 @@ class Engine:
         # Process the run_times of individual sub-graphs.
         # Process the backward graphs in reverse order and
         # then process the forward graphs in the given order
-        self.prev_runtimes: Dict[int, Dict[GraphType, float]] = {}
+
         num_graphs = len(self.profilers.keys())
         cumulative_run_time: float = 0
         for gid in reversed(range(num_graphs)):
             bwd_profiler: GraphProfiler = self.profilers[gid][BACKWARD]
-            self.prev_runtimes[gid] = {}
-            self.prev_runtimes[gid][BACKWARD] = cumulative_run_time
+            bwd_profiler.prev_runtime = cumulative_run_time
             cumulative_run_time += bwd_profiler.total_runtime
 
         for gid in range(num_graphs):
             fwd_profiler: GraphProfiler = self.profilers[gid][FORWARD]
-            self.prev_runtimes[gid][FORWARD] = cumulative_run_time
+            fwd_profiler.prev_runtime = cumulative_run_time
             cumulative_run_time += fwd_profiler.total_runtime
 
     def run(self, x: torch.Tensor):
@@ -239,17 +240,20 @@ class Engine:
                 bucket_dict[gm._id] = gm_bucket_list
 
         if bucketing_strategy == BucketingStrategy.FIXED:
-            ordered_buckets: List[List[BucketElement]] = fixed_bucketing(
+            ordered_buckets: List[Bucket] = fixed_bucketing(
                 bucket_dict,
                 self.profilers,
-                self.prev_runtimes,
                 MIN_BUCKET_SIZE,
                 MAX_BUCKET_SIZE,
                 scheduling_policy,
             )
         elif bucketing_strategy == BucketingStrategy.VARIABLE:
-            ordered_buckets: List[List[BucketElement]] = variable_bucketing(
-                bucket_dict, self.profilers, self.prev_runtimes, scheduling_policy
+            ordered_buckets: List[Bucket] = variable_bucketing(
+                bucket_dict, self.profilers, scheduling_policy
+            )
+        elif bucketing_strategy == BucketingStrategy.CONSTANT:
+            ordered_buckets: List[Bucket] = constant_bucketing(
+                bucket_dict, self.profilers, MIN_BUCKET_SIZE, scheduling_policy
             )
 
         # perfrom graph rewrite here
@@ -434,7 +438,7 @@ class Engine:
 
         # HACK: fuse allreduces across sub-graphs
         self._allreduce_bucketing_scheduling(structured_graphs)
-        self._fuse_allreduce(self.bucket_mb, structured_graphs)
+        # self._fuse_allreduce(self.bucket_mb, structured_graphs)
 
         logging.info(f"Structured Sub-Graphs: {structured_graphs}")
         return optimize_ctx

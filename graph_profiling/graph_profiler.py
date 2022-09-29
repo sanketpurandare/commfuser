@@ -112,6 +112,7 @@ class GraphProfiler(Interpreter):
         self.node_cpu_swaptime: Dict[Node, float] = {}
         self.intermediate_nodes: List[Node] = []
         self.torch_profiler: torch.profiler.profile = None
+        self.prev_runtime = 0
         self.env = {}
 
         # Can define any variables that you need to measure the runtime events
