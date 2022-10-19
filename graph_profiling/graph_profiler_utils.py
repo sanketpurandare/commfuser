@@ -15,9 +15,9 @@ PYTORCH_MIN_ALLOCATE = 2**20
 # the minimal cache memory size (Byte)
 PYTORCH_MIN_CACHE = 2**20
 # default device for graph based profiling
-DEVICE = torch.device("cuda")
+
 # Used for determining if the peak memory usage exceeds the device memory
-MEM_LIMIT = torch.cuda.get_device_properties(DEVICE).total_memory
+
 
 # forward declaration of the GraphProfiler class
 class GraphProfiler(Interpreter):

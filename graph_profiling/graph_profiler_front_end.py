@@ -276,7 +276,7 @@ if __name__ == "__main__":
 
     model_name = "torchbenchmark.models.hf_GPT2_large.Model"
     batch_size = 2
-    device = torch.device("cuda")
+    device = torch.cuda.current_device()
     model, forward_loss, optimizer, example_inputs = get_benchmark_model(
         model_name, batch_size=batch_size, device=device
     )

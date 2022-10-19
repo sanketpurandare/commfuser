@@ -9,17 +9,16 @@ from typing import Tuple
 
 import tabulate
 import torch
-from graph_profiler_utils import DEVICE
-from graph_profiler_utils import MEM_LIMIT
-from graph_profiler_utils import BiDict
-from graph_profiler_utils import GraphProfiler
-from graph_profiler_utils import GraphType
-from graph_profiler_utils import IntNodeInfo
-from graph_profiler_utils import NodeInfo
-from graph_profiler_utils import ProfileMode
-from graph_profiler_utils import TensorStatus
-from graph_profiler_utils import get_tensor_stat
-from graph_profiler_utils import profile_mode_dict
+
+from commfuser.graph_profiling.graph_profiler_utils import BiDict
+from commfuser.graph_profiling.graph_profiler_utils import GraphProfiler
+from commfuser.graph_profiling.graph_profiler_utils import GraphType
+from commfuser.graph_profiling.graph_profiler_utils import IntNodeInfo
+from commfuser.graph_profiling.graph_profiler_utils import NodeInfo
+from commfuser.graph_profiling.graph_profiler_utils import ProfileMode
+from commfuser.graph_profiling.graph_profiler_utils import TensorStatus
+from commfuser.graph_profiling.graph_profiler_utils import get_tensor_stat
+from commfuser.graph_profiling.graph_profiler_utils import profile_mode_dict
 from torch.autograd.profiler_util import EventList
 from torch.fx import GraphModule
 from torch.fx import Interpreter
@@ -75,6 +74,7 @@ class GraphProfiler(Interpreter):
         profile_mode: Optional[str] = "default",
     ):
         super().__init__(graphmod, True)
+        print("Current Device: ",torch.cuda.current_device())
         self.gtype: GraphType = gtype
         self.id: int = graphmod._id
         torch.cuda.reset_peak_memory_stats()
@@ -279,10 +279,13 @@ class GraphProfiler(Interpreter):
         return self.run([])
 
     def run(self, *args) -> Any:
+        if(self.gtype == GraphType.forward):       
+            self.param_memory:int = torch.cuda.memory_allocated()
         return_val = super().run(*args, initial_env=self.env)
         args = None
         if self.gtype == GraphType.backward:
             torch.cuda.synchronize()
+            self.param_grad_memory:int = torch.cuda.memory_allocated()
         self.env = {}
         return return_val
 
@@ -311,7 +314,7 @@ class GraphProfiler(Interpreter):
                         assert isinstance(cpu_ref, torch.Tensor) and cpu_ref.is_pinned
                         with record_function(f"g{self.id}_{f_node.name}_swap"):
                             t = cpu_ref.to(
-                                device=DEVICE,
+                                device=torch.cuda.current_device(),
                                 memory_format=torch.preserve_format,
                             )
                         self.env[p_node] = t.contiguous()
@@ -407,6 +410,7 @@ class GraphProfiler(Interpreter):
                 )
 
     def get_peakmem_usage(self) -> None:
+        MEM_LIMIT = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
         if self.profile_mode == ProfileMode.swap:
             intermediate_mem = 0
             if self.gtype == GraphType.backward:
