@@ -25,7 +25,7 @@ from torch.fx import Interpreter
 from torch.fx import Node
 from torch.fx.node import map_arg
 from torch.profiler import record_function
-
+MEM_LIMIT = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
 
 class GraphProfiler(Interpreter):
     r"""The main GraphProfiler class that extends the fx.Interpreter and runs
@@ -410,7 +410,7 @@ class GraphProfiler(Interpreter):
                 )
 
     def get_peakmem_usage(self) -> None:
-        MEM_LIMIT = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+        
         if self.profile_mode == ProfileMode.swap:
             intermediate_mem = 0
             if self.gtype == GraphType.backward:
