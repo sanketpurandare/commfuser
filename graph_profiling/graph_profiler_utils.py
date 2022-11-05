@@ -3,6 +3,7 @@ from enum import Enum
 from enum import auto
 from typing import List
 from typing import Tuple
+from typing import Optional
 
 import torch
 from torch.fx import GraphModule
@@ -239,6 +240,37 @@ class IntNodeInfo(NodeInfo):
         self.rcomp_mem: int = 0
         self.MSPS: float = 0
         self.is_recomp: bool = False
+
+
+class ProfInfo:
+    def __init__(
+        self,
+        run_time: float,
+        cumulative_run_time: float,
+        peak_mem: int,
+        active_mem: int,
+        in_peak_interval: bool,
+        total_peak_mem: int,
+        is_int_node: bool,
+        idle_time: Optional[float] = 0,
+        swap_time: Optional[float] = 0,
+        size: Optional[int] = 0,
+        memory_size: Optional[int] = 0,
+        numel: Optional[int] = 0,
+    ):
+        self.run_time = run_time
+        self.cumulative_run_time = cumulative_run_time
+        self.peak_mem = peak_mem
+        self.active_mem = active_mem
+        self.in_peak_interval = in_peak_interval
+        self.total_peak_mem = total_peak_mem
+
+        if is_int_node:
+            self.idle_time = idle_time
+            self.swap_time = swap_time
+            self.size = size
+            self.memory_size = memory_size
+            self.numel = numel
 
     def updateMSPS(self):
         # The metric currently being used in Recomputation algorithm (Future

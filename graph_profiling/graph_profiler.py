@@ -6,15 +6,16 @@ from typing import Iterator
 from typing import List
 from typing import Optional
 from typing import Tuple
-
+import os
+import dill as pickle
 import tabulate
 import torch
-
 from commfuser.graph_profiling.graph_profiler_utils import BiDict
 from commfuser.graph_profiling.graph_profiler_utils import GraphProfiler
 from commfuser.graph_profiling.graph_profiler_utils import GraphType
 from commfuser.graph_profiling.graph_profiler_utils import IntNodeInfo
 from commfuser.graph_profiling.graph_profiler_utils import NodeInfo
+from commfuser.graph_profiling.graph_profiler_utils import ProfInfo
 from commfuser.graph_profiling.graph_profiler_utils import ProfileMode
 from commfuser.graph_profiling.graph_profiler_utils import TensorStatus
 from commfuser.graph_profiling.graph_profiler_utils import get_tensor_stat
@@ -25,7 +26,9 @@ from torch.fx import Interpreter
 from torch.fx import Node
 from torch.fx.node import map_arg
 from torch.profiler import record_function
+
 MEM_LIMIT = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+PROF_DIR = "Prof_Info"
 
 class GraphProfiler(Interpreter):
     r"""The main GraphProfiler class that extends the fx.Interpreter and runs
@@ -74,7 +77,7 @@ class GraphProfiler(Interpreter):
         profile_mode: Optional[str] = "default",
     ):
         super().__init__(graphmod, True)
-        print("Current Device: ",torch.cuda.current_device())
+        print("Current Device: ", torch.cuda.current_device())
         self.gtype: GraphType = gtype
         self.id: int = graphmod._id
         torch.cuda.reset_peak_memory_stats()
@@ -279,13 +282,13 @@ class GraphProfiler(Interpreter):
         return self.run([])
 
     def run(self, *args) -> Any:
-        if(self.gtype == GraphType.forward):       
-            self.param_memory:int = torch.cuda.memory_allocated()
+        if self.gtype == GraphType.forward:
+            self.param_memory: int = torch.cuda.memory_allocated()
         return_val = super().run(*args, initial_env=self.env)
         args = None
         if self.gtype == GraphType.backward:
             torch.cuda.synchronize()
-            self.param_grad_memory:int = torch.cuda.memory_allocated()
+            self.param_grad_memory: int = torch.cuda.memory_allocated()
         self.env = {}
         return return_val
 
@@ -410,7 +413,7 @@ class GraphProfiler(Interpreter):
                 )
 
     def get_peakmem_usage(self) -> None:
-        
+
         if self.profile_mode == ProfileMode.swap:
             intermediate_mem = 0
             if self.gtype == GraphType.backward:
@@ -580,3 +583,67 @@ class GraphProfiler(Interpreter):
                 val_list.append(n_info.total_peak_mem)
             node_summaries.append(val_list)
         return tabulate.tabulate(node_summaries, headers=headers)
+
+    def save_node_info(self, dir:str):
+
+        dirname = f"{PROF_DIR}/{dir}"
+        if not os.path.exists(dirname):
+            os.makedirs(dirname)
+
+        profile_stats: Dict[str, ProfInfo] = {}
+        for node, ninfo in self.node_info.items():
+            if node in self.intermediate_nodes:
+                pinfo = ProfInfo(
+                    ninfo.run_time,
+                    ninfo.cumulative_run_time,
+                    ninfo.peak_mem,
+                    ninfo.active_mem,
+                    ninfo.in_peak_interval,
+                    ninfo.total_peak_mem,
+                    True,
+                    ninfo.idle_time,
+                    ninfo.swap_time,
+                    ninfo.size,
+                    ninfo.memory_size,
+                    ninfo.numel,
+                )
+                profile_stats[node.name] = pinfo
+            else:
+                pinfo = ProfInfo(
+                    ninfo.run_time,
+                    ninfo.cumulative_run_time,
+                    ninfo.peak_mem,
+                    ninfo.active_mem,
+                    ninfo.in_peak_interval,
+                    ninfo.total_peak_mem,
+                    False,
+                )
+                profile_stats[node.name] = pinfo
+
+        filename = f"{dirname}/{dir}.profinfo"
+        with open(filename, "wb") as outp:
+            pickle.dump(profile_stats, outp, pickle.HIGHEST_PROTOCOL)
+
+    def load_prof_info(self, dir):
+        dirname = f"{PROF_DIR}/{dir}"
+        filename = f"{dirname}/{dir}.profinfo"
+        with open(filename, "rb") as inp:
+            profile_stats:Dict[str, ProfInfo] = pickle.load(inp)
+
+        for node, ninfo in self.node_info.items():
+            pinfo:ProfInfo = profile_stats[node.name]
+            ninfo.run_time = pinfo.run_time
+            ninfo.cumulative_run_time = pinfo.run_time
+            ninfo.active_mem = pinfo.active_mem
+            ninfo.peak_mem = pinfo.peak_mem
+            ninfo.total_peak_mem = pinfo.total_peak_mem
+            ninfo.in_peak_interval = pinfo.in_peak_interval
+
+            if(node in self.intermediate_nodes):
+                ninfo.idle_time = pinfo.idle_time
+                ninfo.swap_time = pinfo.swap_time
+                ninfo.size = pinfo.size
+                ninfo.memory_size = pinfo.memory_size
+                ninfo.numel = pinfo.numel
+        
+
