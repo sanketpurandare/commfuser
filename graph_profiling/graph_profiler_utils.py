@@ -240,6 +240,11 @@ class IntNodeInfo(NodeInfo):
         self.rcomp_mem: int = 0
         self.MSPS: float = 0
         self.is_recomp: bool = False
+        
+    def updateMSPS(self):
+        # The metric currently being used in Recomputation algorithm (Future
+        # Use)
+        self.MSPS = self.memory_size / self.exe_time
 
 
 class ProfInfo:
@@ -272,7 +277,3 @@ class ProfInfo:
             self.memory_size = memory_size
             self.numel = numel
 
-    def updateMSPS(self):
-        # The metric currently being used in Recomputation algorithm (Future
-        # Use)
-        self.MSPS = self.memory_size / self.exe_time

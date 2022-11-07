@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any
 from typing import Callable
 from typing import Dict
@@ -12,6 +13,7 @@ import torch.optim as optim
 import torchdynamo
 from functorch.compile import aot_module
 from graph_profiler import GraphProfiler
+from graph_profiler import PROF_DIR
 from graph_profiler import GraphType
 from torch import fx
 from torch.profiler import ProfilerActivity
@@ -24,15 +26,6 @@ from torchbenchmark.util.benchmark_utils import get_benchmark_model
 FORWARD = GraphType.forward
 BACKWARD = GraphType.backward
 
-
-class SaveToCpu(nn.Module):
-    def __init__(self, module):
-        super().__init__()
-        self.module = module
-
-    def forward(self, *args, **kwargs):
-        with torch.autograd.graph.save_on_cpu(pin_memory=True):
-            return self.module(*args, **kwargs)
 
 
 class ProfileEngine:
@@ -92,6 +85,7 @@ class ProfileEngine:
         self.profile_mode: str = profile_mode
         self.profile_ctx = None
         self.profilers: Dict[int, Dict[GraphType, GraphProfiler]] = {}
+        self.mod_id = ""
 
     def run(self, warm_up_iters: Optional[int] = 0, profile_iters: Optional[int] = 1):
         r"""
@@ -109,6 +103,20 @@ class ProfileEngine:
         """
         if self.profile_ctx is None:
             self.profile_ctx = self._compile()
+
+        dirname = f"{PROF_DIR}/{self.mod_id}"
+        filename1 = f"{dirname}/{self.mod_id}.profinfo"
+
+        if os.path.isfile(filename1):
+            for prof_dict in self.profilers.values():
+                fwd_profiler = prof_dict.get(FORWARD, None)
+                bwd_profiler = prof_dict.get(BACKWARD, None)
+                if fwd_profiler is not None:
+                    fwd_profiler.load_prof_info(self.mod_id)
+                if bwd_profiler is not None:
+                    bwd_profiler.load_prof_info(self.mod_id)
+            return
+
         my_schedule = schedule(
             skip_first=1, wait=1, warmup=warm_up_iters, active=profile_iters
         )
@@ -276,12 +284,14 @@ if __name__ == "__main__":
 
     model_name = "torchbenchmark.models.hf_GPT2_large.Model"
     batch_size = 2
+    mod_id = f"{model_name}_{batch_size}"
     device = torch.cuda.current_device()
     model, forward_loss, optimizer, example_inputs = get_benchmark_model(
         model_name, batch_size=batch_size, device=device
     )
 
     engine = ProfileEngine(model, forward_loss, optimizer, example_inputs, "default")
+    engine.mod_id = mod_id
 
     engine.run(warm_up_iters=2, profile_iters=3)
 

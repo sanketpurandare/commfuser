@@ -584,66 +584,90 @@ class GraphProfiler(Interpreter):
             node_summaries.append(val_list)
         return tabulate.tabulate(node_summaries, headers=headers)
 
-    def save_node_info(self, dir:str):
+    def save_node_info(self, mod_id:str):
 
-        dirname = f"{PROF_DIR}/{dir}"
+        dirname = f"{PROF_DIR}/{mod_id}"
         if not os.path.exists(dirname):
             os.makedirs(dirname)
+        if self.gtype ==  GraphType.forward:
+            profile_stats: Dict[str, ProfInfo] = {}
+            for node, ninfo in self.node_info.items():
+                if node in self.intermediate_nodes:
+                    pinfo = ProfInfo(
+                        ninfo.run_time,
+                        ninfo.cumulative_run_time,
+                        ninfo.peak_mem,
+                        ninfo.active_mem,
+                        ninfo.in_peak_interval,
+                        ninfo.total_peak_mem,
+                        True,
+                        ninfo.idle_time,
+                        ninfo.swap_time,
+                        ninfo.size,
+                        ninfo.memory_size,
+                        ninfo.numel,
+                    )
+                    profile_stats[node.name] = pinfo
+                else:
+                    pinfo = ProfInfo(
+                        ninfo.run_time,
+                        ninfo.cumulative_run_time,
+                        ninfo.peak_mem,
+                        ninfo.active_mem,
+                        ninfo.in_peak_interval,
+                        ninfo.total_peak_mem,
+                        False,
+                    )
+                    profile_stats[node.name] = pinfo
 
-        profile_stats: Dict[str, ProfInfo] = {}
-        for node, ninfo in self.node_info.items():
-            if node in self.intermediate_nodes:
-                pinfo = ProfInfo(
-                    ninfo.run_time,
-                    ninfo.cumulative_run_time,
-                    ninfo.peak_mem,
-                    ninfo.active_mem,
-                    ninfo.in_peak_interval,
-                    ninfo.total_peak_mem,
-                    True,
-                    ninfo.idle_time,
-                    ninfo.swap_time,
-                    ninfo.size,
-                    ninfo.memory_size,
-                    ninfo.numel,
-                )
-                profile_stats[node.name] = pinfo
-            else:
-                pinfo = ProfInfo(
-                    ninfo.run_time,
-                    ninfo.cumulative_run_time,
-                    ninfo.peak_mem,
-                    ninfo.active_mem,
-                    ninfo.in_peak_interval,
-                    ninfo.total_peak_mem,
-                    False,
-                )
-                profile_stats[node.name] = pinfo
+            filename = f"{dirname}/{mod_id}.profinfo"
+            with open(filename, "wb") as outp:
+                pickle.dump(profile_stats, outp, pickle.HIGHEST_PROTOCOL)
 
-        filename = f"{dirname}/{dir}.profinfo"
+        profile_meta:Dict[str, str] = {}
+        profile_meta['max_peak_mem'] = self.max_peak_mem 
+        profile_meta['min_peak_mem'] = self.min_peak_mem
+        profile_meta['peak_start'] = None if self.peak_start is None else self.peak_start.name
+        profile_meta['peak_end'] = None if self.peak_end is None else self.peak_end.name
+        profile_meta['prev_runtime'] = self.prev_runtime
+        profile_meta['total_runtime'] = self.total_runtime
+        filename = f"{dirname}/{mod_id}_fw.metaprofinfo" if self.gtype == GraphType.forward else f"{dirname}/{mod_id}_bw.metaprofinfo"
         with open(filename, "wb") as outp:
             pickle.dump(profile_stats, outp, pickle.HIGHEST_PROTOCOL)
 
-    def load_prof_info(self, dir):
-        dirname = f"{PROF_DIR}/{dir}"
-        filename = f"{dirname}/{dir}.profinfo"
+    def load_prof_info(self, mod_id):
+        dirname = f"{PROF_DIR}/{mod_id}"
+        if self.gtype == GraphType.forward:
+            filename = f"{dirname}/{mod_id}.profinfo"
+            with open(filename, "rb") as inp:
+                profile_stats:Dict[str, ProfInfo] = pickle.load(inp)
+
+            for node, ninfo in self.node_info.items():
+                pinfo:ProfInfo = profile_stats[node.name]
+                ninfo.run_time = pinfo.run_time
+                ninfo.cumulative_run_time = pinfo.run_time
+                ninfo.active_mem = pinfo.active_mem
+                ninfo.peak_mem = pinfo.peak_mem
+                ninfo.total_peak_mem = pinfo.total_peak_mem
+                ninfo.in_peak_interval = pinfo.in_peak_interval
+
+                if(node in self.intermediate_nodes):
+                    ninfo.idle_time = pinfo.idle_time
+                    ninfo.swap_time = pinfo.swap_time
+                    ninfo.size = pinfo.size
+                    ninfo.memory_size = pinfo.memory_size
+                    ninfo.numel = pinfo.numel
+
+        filename = f"{dirname}/{mod_id}_fw.metaprofinfo" if self.gtype == GraphType.forward else f"{dirname}/{mod_id}_bw.metaprofinfo"
         with open(filename, "rb") as inp:
-            profile_stats:Dict[str, ProfInfo] = pickle.load(inp)
+            profile_meta:Dict[str, str] = pickle.load(inp)
 
-        for node, ninfo in self.node_info.items():
-            pinfo:ProfInfo = profile_stats[node.name]
-            ninfo.run_time = pinfo.run_time
-            ninfo.cumulative_run_time = pinfo.run_time
-            ninfo.active_mem = pinfo.active_mem
-            ninfo.peak_mem = pinfo.peak_mem
-            ninfo.total_peak_mem = pinfo.total_peak_mem
-            ninfo.in_peak_interval = pinfo.in_peak_interval
+        self.max_peak_mem = profile_meta['max_peak_mem']
+        self.min_peak_mem = profile_meta['min_peak_mem']
+        self.peak_start = profile_stats['peak_start']
+        self.peak_end = profile_stats['peak_end']
+        self.prev_runtime = profile_stats['prev_runtime']
+        self.total_runtime = profile_stats['total_runtime']
 
-            if(node in self.intermediate_nodes):
-                ninfo.idle_time = pinfo.idle_time
-                ninfo.swap_time = pinfo.swap_time
-                ninfo.size = pinfo.size
-                ninfo.memory_size = pinfo.memory_size
-                ninfo.numel = pinfo.numel
         
 
