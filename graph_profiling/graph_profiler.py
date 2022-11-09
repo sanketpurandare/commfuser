@@ -30,6 +30,7 @@ from torch.profiler import record_function
 MEM_LIMIT = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
 PROF_DIR = "Prof_Info"
 
+
 class GraphProfiler(Interpreter):
     r"""The main GraphProfiler class that extends the fx.Interpreter and runs
     the input graph module node by node, collecting profiling information for
@@ -115,7 +116,8 @@ class GraphProfiler(Interpreter):
         self.node_cpu_swaptime: Dict[Node, float] = {}
         self.intermediate_nodes: List[Node] = []
         self.torch_profiler: torch.profiler.profile = None
-        self.prev_runtime = 0
+        self.prev_runtime:float = 0
+        self.needs_summary:bool = True
         self.env = {}
 
         # Can define any variables that you need to measure the runtime events
@@ -492,7 +494,10 @@ class GraphProfiler(Interpreter):
                     self.node_cpu_swaptime[int_n] = cpu_time / 1000.0
                     self.swaptimes_sec[int_n] = max(cpu_time, cuda_time) / 1000.0
 
-    def summarize(self) -> Optional[Tuple[Any]]:
+    def summarize(self) -> None:
+
+        if not self.needs_summary:
+            return
 
         self.get_node_runtimes()
         self.total_runtime = 0
@@ -501,6 +506,8 @@ class GraphProfiler(Interpreter):
             if node.op != "placeholder":
                 n_info: NodeInfo = self.node_info.setdefault(node, NodeInfo())
                 n_info.run_time = self.runtimes_sec.get(node, 1.0)
+                n_info.cuda_time = self.node_cuda_time.get(node, 1.0)
+                n_info.cpu_time = self.node_cpu_time.get(node, 1.0)
                 n_info.exe_time = n_info.run_time
                 self.total_runtime += n_info.run_time
                 n_info.cumulative_run_time = self.total_runtime
@@ -561,8 +568,8 @@ class GraphProfiler(Interpreter):
                 str(node),
                 n_info.run_time,
                 pct_total,
-                self.node_cuda_time[node],
-                self.node_cpu_time[node],
+                n_info.cuda_time,
+                n_info.cpu_time,
             ]
             if self.profile_mode in [ProfileMode.swap, ProfileMode.memory]:
                 val_list.extend([n_info.active_mem, n_info.peak_mem])
@@ -584,17 +591,19 @@ class GraphProfiler(Interpreter):
             node_summaries.append(val_list)
         return tabulate.tabulate(node_summaries, headers=headers)
 
-    def save_node_info(self, mod_id:str):
+    def save_node_info(self, mod_id: str):
 
         dirname = f"{PROF_DIR}/{mod_id}"
         if not os.path.exists(dirname):
             os.makedirs(dirname)
-        if self.gtype ==  GraphType.forward:
+        if self.gtype == GraphType.forward:
             profile_stats: Dict[str, ProfInfo] = {}
             for node, ninfo in self.node_info.items():
                 if node in self.intermediate_nodes:
                     pinfo = ProfInfo(
                         ninfo.run_time,
+                        ninfo.cuda_time,
+                        ninfo.cpu_time,
                         ninfo.cumulative_run_time,
                         ninfo.peak_mem,
                         ninfo.active_mem,
@@ -611,6 +620,8 @@ class GraphProfiler(Interpreter):
                 else:
                     pinfo = ProfInfo(
                         ninfo.run_time,
+                        ninfo.cuda_time,
+                        ninfo.cpu_time,
                         ninfo.cumulative_run_time,
                         ninfo.peak_mem,
                         ninfo.active_mem,
@@ -620,54 +631,63 @@ class GraphProfiler(Interpreter):
                     )
                     profile_stats[node.name] = pinfo
 
-            filename = f"{dirname}/{mod_id}.profinfo"
+            filename = f"{dirname}/{mod_id}_{self.id}.profinfo"
             with open(filename, "wb") as outp:
                 pickle.dump(profile_stats, outp, pickle.HIGHEST_PROTOCOL)
 
-        profile_meta:Dict[str, str] = {}
-        profile_meta['max_peak_mem'] = self.max_peak_mem 
-        profile_meta['min_peak_mem'] = self.min_peak_mem
-        profile_meta['peak_start'] = None if self.peak_start is None else self.peak_start.name
-        profile_meta['peak_end'] = None if self.peak_end is None else self.peak_end.name
-        profile_meta['prev_runtime'] = self.prev_runtime
-        profile_meta['total_runtime'] = self.total_runtime
-        filename = f"{dirname}/{mod_id}_fw.metaprofinfo" if self.gtype == GraphType.forward else f"{dirname}/{mod_id}_bw.metaprofinfo"
+        profile_meta: Dict[str, str] = {}
+        profile_meta["max_peak_mem"] = self.max_peak_mem
+        profile_meta["min_peak_mem"] = self.min_peak_mem
+        profile_meta["peak_start"] = (
+            None if self.peak_start is None else self.peak_start.name
+        )
+        profile_meta["peak_end"] = None if self.peak_end is None else self.peak_end.name
+        profile_meta["prev_runtime"] = self.prev_runtime
+        profile_meta["total_runtime"] = self.total_runtime
+        filename = (
+            f"{dirname}/{mod_id}_fw_{self.id}.metaprofinfo"
+            if self.gtype == GraphType.forward
+            else f"{dirname}/{mod_id}_bw_{self.id}.metaprofinfo"
+        )
         with open(filename, "wb") as outp:
-            pickle.dump(profile_stats, outp, pickle.HIGHEST_PROTOCOL)
+            pickle.dump(profile_meta, outp, pickle.HIGHEST_PROTOCOL)
 
     def load_prof_info(self, mod_id):
         dirname = f"{PROF_DIR}/{mod_id}"
         if self.gtype == GraphType.forward:
-            filename = f"{dirname}/{mod_id}.profinfo"
+            filename = f"{dirname}/{mod_id}_{self.id}.profinfo"
             with open(filename, "rb") as inp:
-                profile_stats:Dict[str, ProfInfo] = pickle.load(inp)
+                profile_stats: Dict[str, ProfInfo] = pickle.load(inp)
 
             for node, ninfo in self.node_info.items():
-                pinfo:ProfInfo = profile_stats[node.name]
+                pinfo: ProfInfo = profile_stats[node.name]
                 ninfo.run_time = pinfo.run_time
-                ninfo.cumulative_run_time = pinfo.run_time
+                ninfo.cuda_time = pinfo.cuda_time
+                ninfo.cpu_time = pinfo.cpu_time
+                ninfo.cumulative_run_time = pinfo.cumulative_run_time
                 ninfo.active_mem = pinfo.active_mem
                 ninfo.peak_mem = pinfo.peak_mem
                 ninfo.total_peak_mem = pinfo.total_peak_mem
                 ninfo.in_peak_interval = pinfo.in_peak_interval
 
-                if(node in self.intermediate_nodes):
+                if node in self.intermediate_nodes:
                     ninfo.idle_time = pinfo.idle_time
                     ninfo.swap_time = pinfo.swap_time
                     ninfo.size = pinfo.size
                     ninfo.memory_size = pinfo.memory_size
                     ninfo.numel = pinfo.numel
 
-        filename = f"{dirname}/{mod_id}_fw.metaprofinfo" if self.gtype == GraphType.forward else f"{dirname}/{mod_id}_bw.metaprofinfo"
+        filename = (
+            f"{dirname}/{mod_id}_fw_{self.id}.metaprofinfo"
+            if self.gtype == GraphType.forward
+            else f"{dirname}/{mod_id}_bw_{self.id}.metaprofinfo"
+        )
         with open(filename, "rb") as inp:
-            profile_meta:Dict[str, str] = pickle.load(inp)
+            profile_meta: Dict[str, str] = pickle.load(inp)
 
-        self.max_peak_mem = profile_meta['max_peak_mem']
-        self.min_peak_mem = profile_meta['min_peak_mem']
-        self.peak_start = profile_stats['peak_start']
-        self.peak_end = profile_stats['peak_end']
-        self.prev_runtime = profile_stats['prev_runtime']
-        self.total_runtime = profile_stats['total_runtime']
-
-        
-
+        self.max_peak_mem = profile_meta["max_peak_mem"]
+        self.min_peak_mem = profile_meta["min_peak_mem"]
+        self.peak_start = profile_meta["peak_start"]
+        self.peak_end = profile_meta["peak_end"]
+        self.prev_runtime = profile_meta["prev_runtime"]
+        self.total_runtime = profile_meta["total_runtime"]

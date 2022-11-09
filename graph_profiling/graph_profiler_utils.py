@@ -169,7 +169,9 @@ class NodeInfo:
         self.rank: int = 0
         self.gtype: GraphType = None
         # populated during profiling
-        self.run_time: float = 1
+        self.run_time: float = 1.0
+        self.cuda_time:float = 1.0
+        self.cpu_time:float = 1.0
         self.cumulative_run_time: float = 1
         self.peak_mem: int = 0
         self.active_mem: int = 0
@@ -240,7 +242,7 @@ class IntNodeInfo(NodeInfo):
         self.rcomp_mem: int = 0
         self.MSPS: float = 0
         self.is_recomp: bool = False
-        
+
     def updateMSPS(self):
         # The metric currently being used in Recomputation algorithm (Future
         # Use)
@@ -251,6 +253,8 @@ class ProfInfo:
     def __init__(
         self,
         run_time: float,
+        cuda_time:float,
+        cpu_time:float,
         cumulative_run_time: float,
         peak_mem: int,
         active_mem: int,
@@ -264,6 +268,8 @@ class ProfInfo:
         numel: Optional[int] = 0,
     ):
         self.run_time = run_time
+        self.cuda_time = cuda_time
+        self.cpu_time = cpu_time
         self.cumulative_run_time = cumulative_run_time
         self.peak_mem = peak_mem
         self.active_mem = active_mem
@@ -276,4 +282,3 @@ class ProfInfo:
             self.size = size
             self.memory_size = memory_size
             self.numel = numel
-
