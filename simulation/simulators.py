@@ -1,6 +1,4 @@
 import logging
-import os
-import sys
 from decimal import MAX_EMAX
 from enum import Enum
 from enum import auto
@@ -10,13 +8,12 @@ from typing import Set
 from typing import Union
 
 import torch
-from commfuser.bucketing.bucketing_strategies import Bucket
+from commfuser.optimization_utils import Bucket
 from commfuser.graph_profiling.graph_profiler import GraphProfiler
 from commfuser.graph_profiling.graph_profiler_front_end import BACKWARD
 from commfuser.graph_profiling.graph_profiler_front_end import FORWARD
 from commfuser.graph_profiling.graph_profiler_utils import GraphType
 from commfuser.graph_profiling.graph_profiler_utils import NodeInfo
-from scheduling.scheduling_policies import SchedulingPolicy
 from torch import fx
 
 

@@ -6,7 +6,7 @@ from enum import auto
 from typing import List
 from typing import Set
 from typing import Union
-
+from commfuser.optimization_utils import Process, SchedulingPolicy
 import torch
 from torch import fx
 
@@ -25,23 +25,6 @@ from torch import fx
 # n/1/r_i/Sum(T_i), Scheduling Problem,” European Journal of Operational Research, 56
 # (1991).
 # https://sci-hub.se/https://www.sciencedirect.com/science/article/abs/pii/037722179290071G
-
-
-class SchedulingPolicy(Enum):
-    FCFS = auto()
-    GREEDY_IPRTT = auto()
-    GREEDY_NDPRTT = auto()
-    BRANCH_AND_BOUND = auto()
-
-
-class Process:
-    def __init__(
-        self, p_id: int, arrival_time: float, deadline: float, burst_time: float
-    ) -> None:
-        self.p_id: int = p_id
-        self.arrival_time: float = arrival_time
-        self.burst_time: float = burst_time
-        self.deadline: float = deadline
 
 
 def fcfs_scheduling(processes: List[Process]) -> List[Process]:

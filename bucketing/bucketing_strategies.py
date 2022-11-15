@@ -1,61 +1,27 @@
 import logging
-import os
 import sys
 from decimal import MAX_EMAX
-from enum import Enum
-from enum import auto
+
 from typing import Dict
 from typing import List
 from typing import Set
 from typing import Union
 
 import torch
-from commfuser.demo.partial_ddp_front_end import get_all_reduce_burst_time
 from commfuser.graph_profiling.graph_profiler import GraphProfiler
 from commfuser.graph_profiling.graph_profiler_front_end import BACKWARD
 from commfuser.graph_profiling.graph_profiler_front_end import FORWARD
 from commfuser.graph_profiling.graph_profiler_utils import GraphType
 from commfuser.graph_profiling.graph_profiler_utils import NodeInfo
 from commfuser.simulation.simulators import get_latency_from_simulator
-from scheduling.scheduling_policies import Process
-from scheduling.scheduling_policies import SchedulingPolicy
-from scheduling.scheduling_policies import branch_and_bound_algorithm
-from scheduling.scheduling_policies import fcfs_scheduling
-from scheduling.scheduling_policies import greedy_scheduling_IPRTT
-from scheduling.scheduling_policies import greedy_scheduling_NDPRTT
+from commfuser.scheduling.scheduling_policies import branch_and_bound_algorithm
+from commfuser.scheduling.scheduling_policies import fcfs_scheduling
+from commfuser.scheduling.scheduling_policies import greedy_scheduling_IPRTT
+from commfuser.scheduling.scheduling_policies import greedy_scheduling_NDPRTT
 from torch import fx
+from commfuser.optimization_utils import Process, SchedulingPolicy, Bucket, BucketElement, get_all_reduce_burst_time
 
 
-class BucketingStrategy(Enum):
-    FIXED = auto()
-    VARIABLE = auto()
-    CONSTANT = auto()
-
-
-class BucketElement:
-    def __init__(self, grad: fx.Node, param: fx.Node, gm_id: int, numel: int) -> None:
-        self.grad: fx.Node = grad
-        self.param: fx.Node = param
-        self.gm_id = gm_id
-        self.numel = numel
-
-
-class Bucket:
-    def __init__(
-        self,
-        bid: int,
-        bucket_list: List[BucketElement],
-        last_grad: fx.Node,
-        first_param: fx.node,
-        first_param_access: fx.Node,
-        burst_time: float,
-    ):
-        self.id: int = bid
-        self.bucket_list: List[BucketElement] = bucket_list
-        self.last_grad: fx.Node = last_grad
-        self.first_param: fx.Node = first_param
-        self.first_param_access: fx.Node = first_param_access
-        self.burst_time: float = burst_time
 
 
 def get_scheduled_bucket_order(
@@ -142,7 +108,9 @@ def get_scheduled_bucket_order(
 
     return ordered_buckets
 
-
+# Given a list of buckets (With one element per bucket) and a bucket size, this
+# method will group the elements into buckets in an fcfs order, with the
+# specified bucket size
 def get_fixed_buckets(
     buckets: List[List[BucketElement]], bucket_size: int
 ) -> List[List[BucketElement]]:
@@ -152,7 +120,7 @@ def get_fixed_buckets(
             total_numel += b.numel
         return total_numel
 
-    bucket_list: List[List[BucketElement]] = []
+    bucketed_list: List[List[BucketElement]] = []
     bsize = 0
     current_head = None
     for b in buckets:
@@ -164,14 +132,14 @@ def get_fixed_buckets(
 
         if bsize >= bucket_size:
             bsize = 0
-            bucket_list.append(current_head)
+            bucketed_list.append(current_head)
             current_head = None
 
     if current_head is not None:
-        bucket_list.append(current_head)
-    return bucket_list
+        bucketed_list.append(current_head)
+    return bucketed_list
 
-
+# This methoda mimicks the 
 def constant_bucketing(
     bucket_dict: Dict[int, List[List[BucketElement]]],
     profilers: Dict[int, Dict[GraphType, GraphProfiler]],
@@ -191,7 +159,13 @@ def constant_bucketing(
     simulated_latency: float = get_latency_from_simulator(ordered_buckets, profilers)
     return ordered_buckets
 
-
+# This method implements constant bucketing.
+# 1) We first create buckets with l=MIN, r=MAX and m=(MIN+MAX)/2 bucket sizes.
+# 2) We then get the scheduling order from the specified scheduling policy for
+#    each of the bucket configurations
+# 3) For each of the bucketing strategy and scheduling order, we obtain the
+#    predicted latency from the simulator
+# 4) We then explore either side of the bucket size range where the latency is minimum.
 def fixed_bucketing(
     bucket_dict: Dict[int, List[List[BucketElement]]],
     profilers: Dict[int, Dict[GraphType, GraphProfiler]],
@@ -289,6 +263,15 @@ def fixed_bucketing(
         scheduling_policy,
     )
 
+
+#The variable bucketing algorithm implements the dynamic bucketing strategy.
+# 1) We start with each individual gradient being a bucket.
+# 2) We then find a pair of buckets, such that when merged cause the latency to
+#    be reduced. The restrivtion for the pair is for them to belong to the same
+#    graph. 
+# 3) We merge this pair of buckets and continue the algorithm.
+# 4) The algorithm terminates, when we cannot find a pair of buckets to merge
+#    such that they latency can be reduced. 
 
 def variable_bucketing(
     bucket_dict: Dict[int, List[List[BucketElement]]],

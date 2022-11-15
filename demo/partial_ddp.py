@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.utils._pytree as pytree
-import torchdynamo
+import torch._dynamo as torchdynamo
 from functorch.compile import aot_function
 from functorch.compile import aot_module
 from functorch.compile import draw_graph

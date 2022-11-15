@@ -9,38 +9,40 @@ from typing import Dict
 from typing import List
 from typing import Set
 from typing import Union
+from typing import Optional
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.utils._pytree as pytree
-import torchdynamo
-from commfuser.bucketing.bucketing_strategies import Bucket
-from commfuser.bucketing.bucketing_strategies import BucketElement
-from commfuser.bucketing.bucketing_strategies import BucketingStrategy
+import torch._dynamo as torchdynamo
+from commfuser.optimization_utils import (
+    BucketElement,
+    BucketingStrategy,
+    SchedulingPolicy,
+    Bucket,
+)
 from commfuser.bucketing.bucketing_strategies import constant_bucketing
 from commfuser.bucketing.bucketing_strategies import fixed_bucketing
 from commfuser.bucketing.bucketing_strategies import variable_bucketing
 from commfuser.graph_profiling.graph_profiler import GraphProfiler
 from commfuser.graph_profiling.graph_profiler_utils import GraphType
-from commfuser.scheduling.scheduling_policies import SchedulingPolicy
-from functorch.compile import aot_function
 from functorch.compile import aot_module
 from functorch.compile import draw_graph
-from graph_profiling.graph_profiler_front_end import BACKWARD
-from graph_profiling.graph_profiler_front_end import FORWARD
-from graph_profiling.graph_profiler_front_end import ProfileEngine
+from commfuser.graph_profiling.graph_profiler_front_end import BACKWARD
+from commfuser.graph_profiling.graph_profiler_front_end import FORWARD
+from commfuser.graph_profiling.graph_profiler_front_end import ProfileEngine
+from torchbenchmark.util.benchmark_utils import get_benchmark_model
 from torch import fx
 from torch import nn
 from torch import optim
 from torch.distributed import ProcessGroup
 
+# We divide the bucket size by 4, since torch.float32 occupies 4 byes and then
+# we can directly use tensor.numel() to check the number of items in the bucket
+
 MIN_BUCKET_SIZE = 25 * (2**18)  # 25MB/4
 MAX_BUCKET_SIZE = 2**28  # 1024MB/4 = 1GB/4
-
-
-def get_all_reduce_burst_time() -> float:
-    pass
 
 
 # Type of the distributed tensor
@@ -77,6 +79,9 @@ class DDP(nn.Module):
                 p._dtags = []
 
             p._dtags.append(DTensorTag(dttype=DTensorType.REPLICATED, pg=pg))
+
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
 
 
 # HACK: dist.allreduce is not compatible with fx/AOTAutograd yet. It will be
@@ -166,6 +171,7 @@ class Engine:
 
     def _profile(self):
         self.profile_engine.run(warm_up_iters=2, profile_iters=3)
+        self.profile_engine.print_summary()
         self.profilers = self.profile_engine.profilers
         self._process_node_info()
 
@@ -186,7 +192,9 @@ class Engine:
             fwd_profiler.prev_runtime = cumulative_run_time
             cumulative_run_time += fwd_profiler.total_runtime
 
-    def run(self, x: torch.Tensor):
+    def run(self, inputs: Optional[Any] = None):
+        if inputs is None:
+            inputs = self.example_inputs
         if self.optimize_ctx is None:
             # _compile() does the following
             # 1. Use TorchDynamo to get individual subgraphs.
@@ -198,13 +206,12 @@ class Engine:
             # 4. Process all these subgraphs together to fuse AllReduce across
             #    subgraphs.
             self._profile()
+            exit()
             self.optimize_ctx = self._compile()
 
-        # Dynamo's context caches compiled graph. Use it for real execution.
-        with self.optimize_ctx:
-            out = self.module(x)
+            # Dynamo's context caches compiled graph. Use it for real execution.
 
-        out.sum().backward()
+            self.forward_loss(self.optimize_ctx(self.model), inputs).backward()
 
     def _allreduce_bucketing_scheduling(
         self,
@@ -216,7 +223,7 @@ class Engine:
         # 2. Create a list of bucket elements for each backward graph module
         # 3. Create a dict for graph_id and bucket list
         # 4. Pass the raw individual buckets, profiling information to the chosen
-        #   bucketing strategy
+        #   bucketing and scheduling strategy
 
         bucket_dict: Dict[int, List[List[BucketElement]]] = {}
         reversed_bwd_gms: List[List[fx.GraphModule]] = [
@@ -423,10 +430,8 @@ class Engine:
         optimize_ctx = torchdynamo.optimize(compiler)
 
         # HACK: use dummy inputs to extract all subgraphs.
-        dummy_inputs = self.module.dummy_inputs()
-        with optimize_ctx:
-            for x in dummy_inputs:
-                self.module(x)
+
+        self.forward_loss(optimize_ctx(self.model), self.example_inputs).backward()
 
         # HACK: retrieve backward graphs and organize them in a structured way
         structured_graphs = []
@@ -437,7 +442,9 @@ class Engine:
                 structured_graphs.append(gm._aot_bwd_graph)
 
         # HACK: fuse allreduces across sub-graphs
-        self._allreduce_bucketing_scheduling(structured_graphs)
+        self._allreduce_bucketing_scheduling(
+            structured_graphs, BucketingStrategy.CONSTANT, SchedulingPolicy.FCFS
+        )
         # self._fuse_allreduce(self.bucket_mb, structured_graphs)
 
         logging.info(f"Structured Sub-Graphs: {structured_graphs}")
@@ -462,28 +469,31 @@ def train_step(model: nn.Module, x: torch.Tensor):
 
 def run_worker(rank, world_size):
     logging.getLogger().setLevel(logging.DEBUG if rank == 0 else logging.CRITICAL)
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    # dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
-    n_features = 1000
-    # create local model on CPU
-    model = MyModel(n_features)
+    model_name = "torchbenchmark.models.hf_GPT2_large.Model"
+    batch_size = 2
+    mod_id = f"{model_name}_{batch_size}"
+    device = torch.cuda.current_device()
+    model, forward_loss, optimizer, example_inputs = get_benchmark_model(
+        model_name, batch_size=batch_size, device=device
+    )
     # tag all parameters as replicated tensor
-    model = DDP(model)
+    model = DDP(model, forward_loss)
     # we should be able to support the following as well DDP(FSDP(model,
     # pg=intra_node), pg=inter_node)
 
     # compile train_step, insert comm ops based on tags in model, and fuse them
-    engine = Engine(model, train_step, bucket_mb=1)
-    for batch in [
-        torch.zeros(2, n_features),
-        torch.ones(2, n_features),
-        -torch.ones(2, n_features),
-    ]:
-        engine.run(batch)
+    engine = Engine(model, forward_loss, optimizer, example_inputs, "default")
+
+    engine.run()
 
 
 if __name__ == "__main__":
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29500"
     world_size = 2
-    mp.spawn(run_worker, args=(world_size,), nprocs=world_size, join=True)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["NET_TYPE"] = "efa"
+    # mp.spawn(run_worker, args=(world_size,), nprocs=world_size, join=True)
+    run_worker(0, 2)
