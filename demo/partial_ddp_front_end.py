@@ -170,7 +170,7 @@ class Engine:
         self.states = StatesModule()
 
     def _profile(self):
-        self.profile_engine.run(warm_up_iters=2, profile_iters=3)
+        self.profile_engine.profile(warm_up_iters=2, profile_iters=3)
         self.profile_engine.print_summary()
         self.profilers = self.profile_engine.profilers
         self._process_node_info()

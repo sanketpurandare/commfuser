@@ -19,6 +19,7 @@ from torch.profiler import profile
 from torch.profiler import record_function
 from torch.profiler import schedule
 from torchbenchmark.util.benchmark_utils import get_benchmark_model
+PROFILE_MODE = True
 
 # torchdynamo.config.capture_scalar_outputs = True
 FORWARD = GraphType.forward
@@ -84,7 +85,7 @@ class ProfileEngine:
         self.profilers: Dict[int, Dict[GraphType, GraphProfiler]] = {}
         self.mod_id = ""
 
-    def run(self, warm_up_iters: Optional[int] = 0, profile_iters: Optional[int] = 1):
+    def profile(self, warm_up_iters: Optional[int] = 0, profile_iters: Optional[int] = 1):
         r"""
         Calls the _compile method to initialize the profiler context. Runs
         optional warm-up profiling iterations. This is sometimes essential to
@@ -98,7 +99,7 @@ class ProfileEngine:
             profile_iters (int): Number of profiling
                                 iterations to perform. Default: 1
         """
-        optimize_ctx = self._compile()
+        self.profile_ctx = self._compile()
 
         dirname = f"{PROF_DIR}/{self.mod_id}"
         filename1 = f"{dirname}/{self.mod_id}_0.profinfo"
@@ -135,9 +136,12 @@ class ProfileEngine:
                         bwd_profiler.torch_profiler = prof
 
             for _ in range(2 + warm_up_iters + profile_iters):
-                self.forward_loss(optimize_ctx(self.model), self.example_inputs).backward()
+                self.forward_loss(self.profile_ctx(self.model), self.example_inputs).backward()
                 self.optimizer.zero_grad(False)
                 prof.step()
+
+    def run(self):
+        self.forward_loss(self.profile_ctx(self.model), self.example_inputs).backward()
 
     def _summary(self) -> None:
         r"""
@@ -206,7 +210,10 @@ class ProfileEngine:
             )
             self.profilers[dynamo_fwd_gm._id][FORWARD] = fwd_profiler
             def dummy_f(args):
-                return fwd_profiler.run(*args)
+                if(PROFILE_MODE):
+                    return fwd_profiler.run(*args)
+                else:
+                    return gm(*args)
             dummy_f._boxed_call = True
             return dummy_f
 
@@ -235,7 +242,11 @@ class ProfileEngine:
             self.profilers[dynamo_fwd_gm._id][BACKWARD] = bwd_profiler
 
             def dummy_f(args):
-                return bwd_profiler.meta_run(args)
+                if PROFILE_MODE:
+                    return bwd_profiler.meta_run(args)
+                else:
+                    print("This was called")
+                    return gm(*args)
 
             dummy_f._boxed_call = True
             return dummy_f
@@ -296,6 +307,8 @@ if __name__ == "__main__":
     engine = ProfileEngine(model, forward_loss, optimizer, example_inputs, "default")
     engine.mod_id = mod_id
 
-    engine.run(warm_up_iters=1, profile_iters=1)
+    engine.profile(warm_up_iters=1, profile_iters=1)
+    PROFILE_MODE = False
+    engine.run()
 
     engine.print_summary()
